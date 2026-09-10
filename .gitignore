@@ -1,0 +1,5 @@
+node_modules/
+firefighter24.db
+firefighter24.db-shm
+firefighter24.db-wal
+.env

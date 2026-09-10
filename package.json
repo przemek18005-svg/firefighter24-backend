@@ -1,0 +1,19 @@
+{
+  "name": "firefighter24-backend",
+  "version": "0.1.0",
+  "description": "Backend API dla Firefighter24 — system operacyjny jednostki OSP",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "better-sqlite3": "^11.3.0",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2",
+    "cors": "^2.8.5",
+    "uuid": "^9.0.1"
+  }
+}
