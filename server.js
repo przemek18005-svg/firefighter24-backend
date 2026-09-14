@@ -6,13 +6,20 @@
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
+const path = require('path');
+const fs = require('fs');
+const rateLimit = require('express-rate-limit');
 const { v4: uuid } = require('uuid');
 const db = require('./db');
 const { signToken, requireAuth, requireRole } = require('./auth');
+const { validateBody, isValidEmail, isValidPassword } = require('./validation');
+const { sendEmail, EMAIL_CONFIGURED } = require('./email');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.set('trust proxy', 1); // Railway stoi za reverse proxy — potrzebne, żeby rate-limit widział prawdziwe IP, nie IP proxy
 
 const PORT = process.env.PORT || 3001;
 
@@ -21,15 +28,33 @@ function logAudit(unitId, userName, action, details) {
     .run(uuid(), unitId, userName, action, details || '');
 }
 
+/* ---------- LIMIT PRÓB (rate limiting) ----------
+   Chroni przed automatycznym zgadywaniem haseł / zalewaniem endpointów
+   rejestracji i resetu. Limit liczony per adres IP. */
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minut
+  max: 15,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Zbyt wiele prób. Spróbuj ponownie za kilka minut.' },
+});
+const strictAuthLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 6, // logowanie i reset — dużo bardziej restrykcyjnie niż reszta
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Zbyt wiele prób logowania. Spróbuj ponownie za kilka minut.' },
+});
+
 // ---------- AUTORYZACJA ----------
 
-app.post('/api/auth/register', (req, res) => {
-  const { unitName, name, email, password } = req.body || {};
-  if (!unitName || !name || !email || !password) {
-    return res.status(400).json({ error: 'Uzupełnij nazwę jednostki, imię i nazwisko, e-mail oraz hasło.' });
-  }
-  if (password.length < 6) return res.status(400).json({ error: 'Hasło musi mieć co najmniej 6 znaków.' });
-
+app.post('/api/auth/register', authLimiter, validateBody({
+  unitName: { required: true, type: 'string', max: 200 },
+  name: { required: true, type: 'string', max: 200 },
+  email: { required: true, type: 'email' },
+  password: { required: true, type: 'password' },
+}), (req, res) => {
+  const { unitName, name, email, password } = req.body;
   const emailLower = email.trim().toLowerCase();
   const existing = db.prepare(`SELECT id FROM users WHERE email = ?`).get(emailLower);
   if (existing) return res.status(409).json({ error: 'Konto z tym adresem e-mail już istnieje.' });
@@ -51,9 +76,11 @@ app.post('/api/auth/register', (req, res) => {
   res.status(201).json({ token: signToken(user), user: { id: userId, name: user.name, email: emailLower, role: 'Zarząd' }, unit: { id: unitId, name: unitName.trim() } });
 });
 
-app.post('/api/auth/login', (req, res) => {
-  const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ error: 'Podaj e-mail i hasło.' });
+app.post('/api/auth/login', strictAuthLimiter, validateBody({
+  email: { required: true, type: 'email' },
+  password: { required: true, type: 'string', max: 200 },
+}), (req, res) => {
+  const { email, password } = req.body;
   const emailLower = email.trim().toLowerCase();
   const user = db.prepare(`SELECT * FROM users WHERE email = ?`).get(emailLower);
   if (!user) return res.status(401).json({ error: 'Nie znaleziono konta z tym adresem e-mail.' });
@@ -65,18 +92,73 @@ app.post('/api/auth/login', (req, res) => {
   res.json({ token: signToken(user), user: { id: user.id, name: user.name, email: user.email, role: user.role }, unit: { id: unit.id, name: unit.name } });
 });
 
-// Reset hasła: w tej wersji od razu ustawia nowe hasło po podaniu e-maila.
-// TODO produkcyjne: wysyłka jednorazowego, wygasającego tokenu na e-mail
-// (np. Resend/SendGrid) zamiast pozwalać na reset samym adresem e-mail.
-app.post('/api/auth/reset-password', (req, res) => {
-  const { email, newPassword } = req.body || {};
-  if (!email || !newPassword) return res.status(400).json({ error: 'Podaj e-mail i nowe hasło.' });
-  if (newPassword.length < 6) return res.status(400).json({ error: 'Hasło musi mieć co najmniej 6 znaków.' });
-  const emailLower = email.trim().toLowerCase();
+/* ---------- RESET HASŁA (prawdziwy, dwuetapowy, z tokenem) ----------
+   Krok 1: użytkownik podaje e-mail -> generujemy jednorazowy token (ważny 1h),
+   zapisujemy TYLKO jego hash w bazie (jak hasło) i wysyłamy e-mail z linkiem.
+   Odpowiedź jest zawsze taka sama niezależnie od tego, czy e-mail istnieje
+   w bazie — to celowe, żeby nie dało się w ten sposób sprawdzać, czyje konta
+   istnieją w systemie (tzw. ochrona przed user enumeration).
+   Krok 2: użytkownik wraca z linku z tokenem i ustawia nowe hasło. */
+app.post('/api/auth/forgot-password', strictAuthLimiter, validateBody({
+  email: { required: true, type: 'email' },
+}), async (req, res) => {
+  const emailLower = req.body.email.trim().toLowerCase();
+  const genericOk = { ok: true, message: 'Jeśli konto z tym adresem e-mail istnieje, wysłaliśmy na nie instrukcje resetu hasła.' };
   const user = db.prepare(`SELECT * FROM users WHERE email = ?`).get(emailLower);
-  if (!user) return res.status(404).json({ error: 'Nie znaleziono konta z tym adresem e-mail.' });
+  if (!user) return res.json(genericOk); // ta sama odpowiedź, żeby nie zdradzać czy konto istnieje
+
+  const rawToken = crypto.randomBytes(32).toString('hex');
+  const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+  const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 godzina
+
+  db.prepare(`INSERT INTO password_resets (id, user_id, token_hash, expires_at) VALUES (?,?,?,?)`)
+    .run(uuid(), user.id, tokenHash, expiresAt);
+
+  const resetUrl = `${process.env.APP_URL || 'https://ezielonka.pl/app/'}?resetToken=${rawToken}&email=${encodeURIComponent(emailLower)}`;
+  const emailResult = await sendEmail({
+    to: emailLower,
+    subject: 'Reset hasła — Firefighter24',
+    html: `<p>Otrzymaliśmy prośbę o reset hasła do konta Firefighter24.</p>
+           <p><a href="${resetUrl}">Kliknij tutaj, aby ustawić nowe hasło</a> (link ważny 1 godzinę).</p>
+           <p>Jeśli to nie Ty prosiłeś o reset, zignoruj tę wiadomość.</p>`,
+  });
+  logAudit(user.unit_id, user.name, 'Poproszono o reset hasła', emailResult.devMode ? '(tryb dev — brak RESEND_API_KEY)' : '');
+
+  // W trybie deweloperskim (brak skonfigurowanego dostawcy e-mail) zwracamy
+  // token wprost w odpowiedzi, inaczej nie dałoby się przetestować resetu
+  // bez podłączonej skrzynki. W prawdziwej produkcji (RESEND_API_KEY ustawiony)
+  // token NIGDY nie wraca w odpowiedzi API — tylko e-mailem.
+  if (emailResult.devMode) {
+    return res.json({ ...genericOk, devToken: rawToken, devNote: 'RESEND_API_KEY nie jest ustawiony — token zwrócony tylko do celów testowych.' });
+  }
+  res.json(genericOk);
+});
+
+app.post('/api/auth/reset-password', strictAuthLimiter, validateBody({
+  email: { required: true, type: 'email' },
+  token: { required: true, type: 'string', max: 128 },
+  newPassword: { required: true, type: 'password' },
+}), (req, res) => {
+  const emailLower = req.body.email.trim().toLowerCase();
+  const { token, newPassword } = req.body;
+  const user = db.prepare(`SELECT * FROM users WHERE email = ?`).get(emailLower);
+  if (!user) return res.status(400).json({ error: 'Link jest nieprawidłowy lub wygasł.' });
+
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  const record = db.prepare(
+    `SELECT * FROM password_resets WHERE user_id = ? AND token_hash = ? AND used = 0 ORDER BY created_at DESC LIMIT 1`
+  ).get(user.id, tokenHash);
+  if (!record) return res.status(400).json({ error: 'Link jest nieprawidłowy lub został już użyty.' });
+  if (new Date(record.expires_at).getTime() < Date.now()) {
+    return res.status(400).json({ error: 'Link wygasł. Poproś o nowy reset hasła.' });
+  }
+
   const passwordHash = bcrypt.hashSync(newPassword, 12);
-  db.prepare(`UPDATE users SET password_hash = ? WHERE id = ?`).run(passwordHash, user.id);
+  const tx = db.transaction(() => {
+    db.prepare(`UPDATE users SET password_hash = ? WHERE id = ?`).run(passwordHash, user.id);
+    db.prepare(`UPDATE password_resets SET used = 1 WHERE id = ?`).run(record.id);
+  });
+  tx();
   logAudit(user.unit_id, user.name, 'Zresetowano hasło', '');
   res.json({ ok: true });
 });
@@ -90,16 +172,18 @@ app.get('/api/me', requireAuth, (req, res) => {
 // ---------- POMOCNICZY GENERATOR TRAS CRUD ----------
 // Każdy zasób jednostki (strażacy, sprzęt, pojazdy...) ma ten sam kształt:
 // lista/dodaj/edytuj/usuń, zawsze filtrowane po unit_id z tokenu — jednostka
-// A nigdy nie zobaczy nawet wiersza danych jednostki B.
-function crudRoutes({ path, table, fields, writeRoles, auditLabel }) {
+// A nigdy nie zobaczy nawet wiersza danych jednostki B. Walidacja (rules) jest
+// teraz obowiązkowa — backend nie ufa ślepo temu, co przyśle klient.
+function crudRoutes({ table, fields, writeRoles, auditLabel, rules }) {
   const router = express.Router();
+  const validator = rules ? validateBody(rules) : (req, res, next) => next();
 
   router.get('/', requireAuth, (req, res) => {
     const rows = db.prepare(`SELECT * FROM ${table} WHERE unit_id = ?`).all(req.user.unitId);
     res.json(rows);
   });
 
-  router.post('/', requireAuth, requireRole(...writeRoles), (req, res) => {
+  router.post('/', requireAuth, requireRole(...writeRoles), validator, (req, res) => {
     const id = uuid();
     const values = fields.map(f => req.body[f] ?? null);
     const cols = ['id', 'unit_id', ...fields];
@@ -111,7 +195,7 @@ function crudRoutes({ path, table, fields, writeRoles, auditLabel }) {
     res.status(201).json(row);
   });
 
-  router.put('/:id', requireAuth, requireRole(...writeRoles), (req, res) => {
+  router.put('/:id', requireAuth, requireRole(...writeRoles), validator, (req, res) => {
     const existing = db.prepare(`SELECT * FROM ${table} WHERE id = ? AND unit_id = ?`).get(req.params.id, req.user.unitId);
     if (!existing) return res.status(404).json({ error: 'Nie znaleziono rekordu.' });
     const setClause = fields.map(f => `${f} = ?`).join(', ');
@@ -133,52 +217,94 @@ function crudRoutes({ path, table, fields, writeRoles, auditLabel }) {
   return router;
 }
 
-// Strażacy: odczyt dla każdego zalogowanego w jednostce, zapis tylko Zarząd
-// — to dokładnie egzekwuje po stronie serwera to, co w prototypie
-// front-endowym było tylko chowaniem przycisków.
 app.use('/api/firefighters', crudRoutes({
   table: 'firefighters', fields: ['first', 'last', 'role', 'join_date', 'med_date'],
   writeRoles: ['Zarząd'], auditLabel: 'strażak',
+  rules: {
+    first: { required: true, type: 'string', max: 100 },
+    last: { required: true, type: 'string', max: 100 },
+    role: { type: 'string', max: 100 },
+    join_date: { type: 'date' },
+    med_date: { type: 'date' },
+  },
 }));
 
 app.use('/api/vehicles', crudRoutes({
   table: 'vehicles', fields: ['name', 'plate', 'oc_date', 'review_date', 'mileage'],
   writeRoles: ['Zarząd'], auditLabel: 'pojazd',
+  rules: {
+    name: { required: true, type: 'string', max: 150 },
+    plate: { type: 'string', max: 30 },
+    oc_date: { type: 'date' },
+    review_date: { type: 'date' },
+    mileage: { type: 'nonNegativeNumber' },
+  },
 }));
 
 app.use('/api/fuel', crudRoutes({
   table: 'fuel_log', fields: ['vehicle_id', 'vehicle_name', 'date', 'liters', 'cost'],
   writeRoles: ['Zarząd'], auditLabel: 'tankowanie',
+  rules: {
+    date: { required: true, type: 'date' },
+    liters: { required: true, type: 'positiveNumber' },
+    cost: { type: 'nonNegativeNumber' },
+  },
 }));
 
 app.use('/api/gear', crudRoutes({
   table: 'gear', fields: ['name', 'category', 'review_date'],
   writeRoles: ['Zarząd'], auditLabel: 'sprzęt',
+  rules: {
+    name: { required: true, type: 'string', max: 150 },
+    review_date: { type: 'date' },
+  },
 }));
 
 app.use('/api/trips', crudRoutes({
   table: 'trips', fields: ['date', 'type', 'place', 'crew'],
   writeRoles: ['Zarząd'], auditLabel: 'wyjazd',
+  rules: {
+    date: { required: true, type: 'date' },
+    place: { type: 'string', max: 200 },
+  },
 }));
 
 app.use('/api/schedule', crudRoutes({
   table: 'schedule', fields: ['type', 'date', 'desc'],
   writeRoles: ['Zarząd'], auditLabel: 'wydarzenie w terminarzu',
+  rules: {
+    date: { required: true, type: 'date' },
+    desc: { type: 'string', max: 500 },
+  },
 }));
 
 app.use('/api/dues', crudRoutes({
   table: 'dues', fields: ['firefighter_id', 'firefighter_name', 'month', 'amount', 'status'],
   writeRoles: ['Zarząd', 'Skarbnik'], auditLabel: 'wpłata składki',
+  rules: {
+    month: { required: true, type: 'month' },
+    amount: { required: true, type: 'positiveNumber' },
+    status: { type: 'enum', enum: ['ok', 'warn'] },
+  },
 }));
 
 app.use('/api/mdp-members', crudRoutes({
   table: 'mdp_members', fields: ['first', 'last', 'dob'],
   writeRoles: ['Zarząd'], auditLabel: 'członek MDP',
+  rules: {
+    first: { required: true, type: 'string', max: 100 },
+    last: { required: true, type: 'string', max: 100 },
+    dob: { type: 'date' },
+  },
 }));
 
 app.use('/api/mdp-meetings', crudRoutes({
   table: 'mdp_meetings', fields: ['date', 'topic', 'present'],
   writeRoles: ['Zarząd'], auditLabel: 'zebranie MDP',
+  rules: {
+    date: { required: true, type: 'date' },
+    present: { type: 'nonNegativeNumber' },
+  },
 }));
 
 // Zadania: dostępne (odczyt i zapis) dla wszystkich ról w jednostce —
@@ -186,6 +312,12 @@ app.use('/api/mdp-meetings', crudRoutes({
 app.use('/api/tasks', crudRoutes({
   table: 'tasks', fields: ['title', 'desc', 'assignee_id', 'assignee_name', 'due', 'priority', 'status'],
   writeRoles: ['Zarząd', 'Skarbnik', 'Strażak'], auditLabel: 'zadanie',
+  rules: {
+    title: { required: true, type: 'string', max: 200 },
+    due: { type: 'date' },
+    priority: { type: 'enum', enum: ['Niski', 'Średni', 'Wysoki'] },
+    status: { type: 'enum', enum: ['Do zrobienia', 'W trakcie', 'Zrobione'] },
+  },
 }));
 
 // ---------- KONTA UŻYTKOWNIKÓW (zarządzanie dostępem w jednostce) ----------
@@ -194,10 +326,13 @@ app.get('/api/users', requireAuth, requireRole('Zarząd'), (req, res) => {
   res.json(rows);
 });
 
-app.post('/api/users', requireAuth, requireRole('Zarząd'), (req, res) => {
-  const { name, email, password, role } = req.body || {};
-  if (!name || !email || !password || !role) return res.status(400).json({ error: 'Uzupełnij wszystkie pola.' });
-  if (password.length < 6) return res.status(400).json({ error: 'Hasło musi mieć co najmniej 6 znaków.' });
+app.post('/api/users', requireAuth, requireRole('Zarząd'), validateBody({
+  name: { required: true, type: 'string', max: 200 },
+  email: { required: true, type: 'email' },
+  password: { required: true, type: 'password' },
+  role: { required: true, type: 'enum', enum: ['Zarząd', 'Skarbnik', 'Strażak'] },
+}), (req, res) => {
+  const { name, email, password, role } = req.body;
   const emailLower = email.trim().toLowerCase();
   if (db.prepare(`SELECT id FROM users WHERE email = ?`).get(emailLower)) {
     return res.status(409).json({ error: 'Konto z tym adresem e-mail już istnieje.' });
@@ -209,10 +344,20 @@ app.post('/api/users', requireAuth, requireRole('Zarząd'), (req, res) => {
   res.status(201).json({ id, name: name.trim(), email: emailLower, role });
 });
 
-app.put('/api/users/:id', requireAuth, requireRole('Zarząd'), (req, res) => {
+app.put('/api/users/:id', requireAuth, requireRole('Zarząd'), validateBody({
+  name: { type: 'string', max: 200 },
+  email: { type: 'email' },
+  password: { type: 'password' },
+  role: { type: 'enum', enum: ['Zarząd', 'Skarbnik', 'Strażak'] },
+}), (req, res) => {
   const target = db.prepare(`SELECT * FROM users WHERE id = ? AND unit_id = ?`).get(req.params.id, req.user.unitId);
   if (!target) return res.status(404).json({ error: 'Nie znaleziono konta.' });
   const { name, email, password, role } = req.body || {};
+  if (email) {
+    const emailLower = email.trim().toLowerCase();
+    const clash = db.prepare(`SELECT id FROM users WHERE email = ? AND id != ?`).get(emailLower, req.params.id);
+    if (clash) return res.status(409).json({ error: 'Ten adres e-mail jest już używany przez inne konto.' });
+  }
   const passwordHash = password ? bcrypt.hashSync(password, 12) : target.password_hash;
   const emailLower = (email || target.email).trim().toLowerCase();
   db.prepare(`UPDATE users SET name=?, email=?, password_hash=?, role=? WHERE id=?`)
@@ -238,8 +383,62 @@ app.get('/api/audit', requireAuth, requireRole('Zarząd'), (req, res) => {
   res.json(rows);
 });
 
-app.get('/api/health', (req, res) => res.json({ ok: true, service: 'firefighter24-backend' }));
+/* ---------- KOPIE ZAPASOWE ----------
+   Dwa niezależne mechanizmy:
+   1) Pełny eksport JSON danych TEJ jednostki na żądanie (Zarząd) — przenośny,
+      działa nawet bez dostępu do systemu plików serwera.
+   2) Automatyczna, cykliczna migawka całego pliku bazy SQLite na wolumenie
+      (wszystkie jednostki naraz) — awaryjna siatka bezpieczeństwa, gdyby coś
+      poszło nie tak z samymi danymi, niezależnie od warstwy aplikacji. */
+app.get('/api/backup/full', requireAuth, requireRole('Zarząd'), (req, res) => {
+  const unitId = req.user.unitId;
+  const tables = {
+    firefighters: 'firefighters', vehicles: 'vehicles', fuel: 'fuel_log', gear: 'gear',
+    trips: 'trips', schedule: 'schedule', dues: 'dues', mdpMembers: 'mdp_members',
+    mdpMeetings: 'mdp_meetings', tasks: 'tasks',
+  };
+  const data = {};
+  for (const [key, table] of Object.entries(tables)) {
+    data[key] = db.prepare(`SELECT * FROM ${table} WHERE unit_id = ?`).all(unitId);
+  }
+  data.users = db.prepare(`SELECT id, name, email, role FROM users WHERE unit_id = ?`).all(unitId);
+  data.auditLog = db.prepare(`SELECT * FROM audit_log WHERE unit_id = ? ORDER BY ts DESC LIMIT 300`).all(unitId);
+  const unit = db.prepare(`SELECT * FROM units WHERE id = ?`).get(unitId);
+  res.json({ app: 'Firefighter24', exportedAt: new Date().toISOString(), unit, data });
+});
+
+const BACKUP_DIR = path.join(path.dirname(db.DB_PATH), 'backups');
+const BACKUP_RETENTION = 7; // dni
+
+function runDbBackup() {
+  try {
+    if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const dest = path.join(BACKUP_DIR, `firefighter24-${stamp}.db`);
+    db.backup(dest)
+      .then(() => {
+        console.log('Kopia zapasowa bazy zapisana:', dest);
+        const files = fs.readdirSync(BACKUP_DIR).filter(f => f.endsWith('.db')).sort();
+        const excess = files.length - BACKUP_RETENTION;
+        if (excess > 0) {
+          files.slice(0, excess).forEach(f => fs.unlinkSync(path.join(BACKUP_DIR, f)));
+        }
+      })
+      .catch(err => console.error('Błąd kopii zapasowej bazy:', err.message));
+  } catch (e) {
+    console.error('Błąd przygotowania kopii zapasowej:', e.message);
+  }
+}
+// Pierwsza kopia wkrótce po starcie, potem co 24h. Wymaga trwałego wolumenu
+// pod BACKUP_DIR (ten sam, na którym leży sama baza) — bez niego kopie i tak
+// zginą przy restarcie kontenera, tak jak sama baza.
+setTimeout(runDbBackup, 60 * 1000);
+setInterval(runDbBackup, 24 * 60 * 60 * 1000);
+
+app.get('/api/health', (req, res) => res.json({ ok: true, service: 'firefighter24-backend', emailConfigured: EMAIL_CONFIGURED }));
 
 app.listen(PORT, () => {
   console.log(`Firefighter24 API działa na porcie ${PORT}`);
+  if (!EMAIL_CONFIGURED) console.log('Uwaga: RESEND_API_KEY nie ustawiony — reset hasła działa w trybie deweloperskim (token w odpowiedzi API, e-mail nie jest wysyłany).');
 });
+

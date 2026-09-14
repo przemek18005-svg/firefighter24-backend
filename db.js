@@ -128,6 +128,15 @@ CREATE TABLE IF NOT EXISTS tasks (
   status TEXT
 );
 
+CREATE TABLE IF NOT EXISTS password_resets (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_hash TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  used INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_firefighters_unit ON firefighters(unit_id);
 CREATE INDEX IF NOT EXISTS idx_vehicles_unit ON vehicles(unit_id);
 CREATE INDEX IF NOT EXISTS idx_gear_unit ON gear(unit_id);
@@ -137,8 +146,10 @@ CREATE INDEX IF NOT EXISTS idx_dues_unit ON dues(unit_id);
 CREATE INDEX IF NOT EXISTS idx_mdp_members_unit ON mdp_members(unit_id);
 CREATE INDEX IF NOT EXISTS idx_mdp_meetings_unit ON mdp_meetings(unit_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_unit ON tasks(unit_id);
+CREATE INDEX IF NOT EXISTS idx_password_resets_user ON password_resets(user_id);
 CREATE INDEX IF NOT EXISTS idx_audit_unit ON audit_log(unit_id);
 CREATE INDEX IF NOT EXISTS idx_users_unit ON users(unit_id);
 `);
 
 module.exports = db;
+module.exports.DB_PATH = DB_PATH;
