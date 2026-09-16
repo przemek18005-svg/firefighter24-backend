@@ -12,7 +12,7 @@ const { v4: uuid } = require('uuid');
 const { pool, initSchema } = require('./db');
 const { signToken, requireAuth, requireRole } = require('./auth');
 const { validateBody } = require('./validation');
-const { sendEmail, EMAIL_CONFIGURED } = require('./email');
+const { sendEmail, EMAIL_CONFIGURED, EMAIL_MODE } = require('./email');
 
 const app = express();
 app.use(cors());
@@ -448,7 +448,7 @@ app.get('/api/backup/full', requireAuth, requireRole('Zarząd'), async (req, res
 app.get('/api/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ ok: true, service: 'firefighter24-backend', db: 'postgres', emailConfigured: EMAIL_CONFIGURED });
+    res.json({ ok: true, service: 'firefighter24-backend', db: 'postgres', emailConfigured: EMAIL_CONFIGURED, emailMode: EMAIL_MODE });
   } catch (e) {
     res.status(500).json({ ok: false, error: 'Baza danych niedostępna.' });
   }
@@ -458,7 +458,7 @@ initSchema()
   .then(() => {
     app.listen(PORT, () => {
       console.log(`Firefighter24 API działa na porcie ${PORT} (PostgreSQL)`);
-      if (!EMAIL_CONFIGURED) console.log('Uwaga: RESEND_API_KEY nie ustawiony — reset hasła działa w trybie deweloperskim.');
+      if (!EMAIL_CONFIGURED) console.log('Uwaga: brak RESEND_API_KEY i SMTP_HOST — reset hasła działa w trybie deweloperskim.');
     });
   })
   .catch((e) => {
