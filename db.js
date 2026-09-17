@@ -48,7 +48,9 @@ async function initSchema() {
       last TEXT NOT NULL,
       role TEXT,
       join_date TEXT,
-      med_date TEXT
+      med_date TEXT,
+      org_body TEXT CHECK(org_body IS NULL OR org_body IN ('zarzad','komisja')),
+      org_role TEXT
     );
 
     CREATE TABLE IF NOT EXISTS vehicles (
@@ -85,7 +87,9 @@ async function initSchema() {
       date TEXT NOT NULL,
       type TEXT,
       place TEXT,
-      crew TEXT
+      crew TEXT,
+      lat REAL,
+      lng REAL
     );
 
     CREATE TABLE IF NOT EXISTS schedule (
@@ -152,6 +156,45 @@ async function initSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS announcements (
+      id TEXT PRIMARY KEY,
+      unit_id TEXT NOT NULL REFERENCES units(id) ON DELETE CASCADE,
+      title TEXT NOT NULL,
+      body TEXT,
+      author_name TEXT,
+      pinned INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS sections (
+      id TEXT PRIMARY KEY,
+      unit_id TEXT NOT NULL REFERENCES units(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS section_members (
+      id TEXT PRIMARY KEY,
+      unit_id TEXT NOT NULL REFERENCES units(id) ON DELETE CASCADE,
+      section_id TEXT NOT NULL REFERENCES sections(id) ON DELETE CASCADE,
+      firefighter_id TEXT NOT NULL REFERENCES firefighters(id) ON DELETE CASCADE,
+      commander INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS sections (
+      id TEXT PRIMARY KEY,
+      unit_id TEXT NOT NULL REFERENCES units(id) ON DELETE CASCADE,
+      name TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS section_members (
+      id TEXT PRIMARY KEY,
+      unit_id TEXT NOT NULL REFERENCES units(id) ON DELETE CASCADE,
+      section_id TEXT NOT NULL REFERENCES sections(id) ON DELETE CASCADE,
+      firefighter_id TEXT NOT NULL REFERENCES firefighters(id) ON DELETE CASCADE,
+      commander INTEGER NOT NULL DEFAULT 0
+    );
+
     CREATE INDEX IF NOT EXISTS idx_firefighters_unit ON firefighters(unit_id);
     CREATE INDEX IF NOT EXISTS idx_vehicles_unit ON vehicles(unit_id);
     CREATE INDEX IF NOT EXISTS idx_gear_unit ON gear(unit_id);
@@ -164,6 +207,28 @@ async function initSchema() {
     CREATE INDEX IF NOT EXISTS idx_audit_unit ON audit_log(unit_id);
     CREATE INDEX IF NOT EXISTS idx_users_unit ON users(unit_id);
     CREATE INDEX IF NOT EXISTS idx_password_resets_user ON password_resets(user_id);
+    CREATE INDEX IF NOT EXISTS idx_announcements_unit ON announcements(unit_id);
+    CREATE INDEX IF NOT EXISTS idx_sections_unit ON sections(unit_id);
+    CREATE INDEX IF NOT EXISTS idx_section_members_unit ON section_members(unit_id);
+    CREATE INDEX IF NOT EXISTS idx_section_members_section ON section_members(section_id);
+    CREATE INDEX IF NOT EXISTS idx_section_members_firefighter ON section_members(firefighter_id);
+    CREATE INDEX IF NOT EXISTS idx_sections_unit ON sections(unit_id);
+    CREATE INDEX IF NOT EXISTS idx_section_members_unit ON section_members(unit_id);
+    CREATE INDEX IF NOT EXISTS idx_section_members_section ON section_members(section_id);
+  `);
+
+  /* ---------- MIGRACJE: dopisywanie kolumn do tabel, które już istniały ----------
+     "CREATE TABLE IF NOT EXISTS" nic nie robi, jeśli tabela już jest w bazie —
+     więc nowe kolumny dodawane do istniejących tabel (np. trips.lat/lng przy
+     module Mapa) muszą przejść osobno przez ALTER TABLE, inaczej cicho by nie
+     trafiły do już działającej bazy na Neon. To jest bezpieczne uruchamiać przy
+     każdym starcie serwera — IF NOT EXISTS sprawia, że nic się nie dzieje,
+     jeśli kolumna już tam jest. */
+  await pool.query(`
+    ALTER TABLE trips ADD COLUMN IF NOT EXISTS lat REAL;
+    ALTER TABLE trips ADD COLUMN IF NOT EXISTS lng REAL;
+    ALTER TABLE firefighters ADD COLUMN IF NOT EXISTS org_body TEXT;
+    ALTER TABLE firefighters ADD COLUMN IF NOT EXISTS org_role TEXT;
   `);
 }
 

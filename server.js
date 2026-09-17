@@ -256,7 +256,7 @@ function crudRoutes({ table, fields, writeRoles, auditLabel, rules }) {
 }
 
 app.use('/api/firefighters', crudRoutes({
-  table: 'firefighters', fields: ['first', 'last', 'role', 'join_date', 'med_date'],
+  table: 'firefighters', fields: ['first', 'last', 'role', 'join_date', 'med_date', 'org_body', 'org_role'],
   writeRoles: ['Zarząd'], auditLabel: 'strażak',
   rules: {
     first: { required: true, type: 'string', max: 100 },
@@ -264,8 +264,55 @@ app.use('/api/firefighters', crudRoutes({
     role: { type: 'string', max: 100 },
     join_date: { type: 'date' },
     med_date: { type: 'date' },
+    org_body: { type: 'enum', enum: ['zarzad', 'komisja'] },
+    org_role: { type: 'string', max: 100 },
   },
 }));
+
+app.use('/api/sections', crudRoutes({
+  table: 'sections', fields: ['name'],
+  writeRoles: ['Zarząd'], auditLabel: 'sekcja',
+  rules: { name: { required: true, type: 'string', max: 150 } },
+}));
+
+// Przypisania strażaków do sekcji — osobne trasy, bo to relacja między dwoma
+// zasobami (sekcja <-> strażak), nie pasuje do generycznego crudRoutes.
+app.get('/api/section-members', requireAuth, async (req, res) => {
+  const rows = await dbAll(`
+    SELECT sm.id, sm.section_id, sm.firefighter_id, sm.commander, f.first, f.last
+    FROM section_members sm
+    JOIN firefighters f ON f.id = sm.firefighter_id
+    WHERE sm.unit_id = $1
+  `, [req.user.unitId]);
+  res.json(rows);
+});
+
+app.post('/api/section-members', requireAuth, requireRole('Zarząd'), validateBody({
+  section_id: { required: true, type: 'string', max: 100 },
+  firefighter_id: { required: true, type: 'string', max: 100 },
+}), async (req, res) => {
+  const { section_id, firefighter_id, commander } = req.body;
+  const section = await dbGet(`SELECT id FROM sections WHERE id = $1 AND unit_id = $2`, [section_id, req.user.unitId]);
+  if (!section) return res.status(404).json({ error: 'Nie znaleziono sekcji.' });
+  const ff = await dbGet(`SELECT id, first, last FROM firefighters WHERE id = $1 AND unit_id = $2`, [firefighter_id, req.user.unitId]);
+  if (!ff) return res.status(404).json({ error: 'Nie znaleziono strażaka.' });
+  const dup = await dbGet(`SELECT id FROM section_members WHERE section_id = $1 AND firefighter_id = $2`, [section_id, firefighter_id]);
+  if (dup) return res.status(409).json({ error: 'Ten strażak jest już przypisany do tej sekcji.' });
+  const id = uuid();
+  await dbRun(
+    `INSERT INTO section_members (id, unit_id, section_id, firefighter_id, commander) VALUES ($1,$2,$3,$4,$5)`,
+    [id, req.user.unitId, section_id, firefighter_id, commander ? 1 : 0]
+  );
+  await logAudit(req.user.unitId, req.user.name, 'Dodano do sekcji', `${ff.first} ${ff.last}`);
+  res.status(201).json({ id, section_id, firefighter_id, commander: commander ? 1 : 0, first: ff.first, last: ff.last });
+});
+
+app.delete('/api/section-members/:id', requireAuth, requireRole('Zarząd'), async (req, res) => {
+  const row = await dbGet(`DELETE FROM section_members WHERE id = $1 AND unit_id = $2 RETURNING id`, [req.params.id, req.user.unitId]);
+  if (!row) return res.status(404).json({ error: 'Nie znaleziono przypisania.' });
+  await logAudit(req.user.unitId, req.user.name, 'Usunięto z sekcji', '');
+  res.status(204).end();
+});
 
 app.use('/api/vehicles', crudRoutes({
   table: 'vehicles', fields: ['name', 'plate', 'oc_date', 'review_date', 'mileage'],
@@ -299,7 +346,7 @@ app.use('/api/gear', crudRoutes({
 }));
 
 app.use('/api/trips', crudRoutes({
-  table: 'trips', fields: ['date', 'type', 'place', 'crew'],
+  table: 'trips', fields: ['date', 'type', 'place', 'crew', 'lat', 'lng'],
   writeRoles: ['Zarząd'], auditLabel: 'wyjazd',
   rules: {
     date: { required: true, type: 'date' },
@@ -353,6 +400,15 @@ app.use('/api/tasks', crudRoutes({
     due: { type: 'date' },
     priority: { type: 'enum', enum: ['Niski', 'Średni', 'Wysoki'] },
     status: { type: 'enum', enum: ['Do zrobienia', 'W trakcie', 'Zrobione'] },
+  },
+}));
+
+// Ogłoszenia: czyta cała jednostka, publikuje i usuwa tylko Zarząd.
+app.use('/api/announcements', crudRoutes({
+  table: 'announcements', fields: ['title', 'body', 'author_name', 'pinned'],
+  writeRoles: ['Zarząd'], auditLabel: 'ogłoszenie',
+  rules: {
+    title: { required: true, type: 'string', max: 200 },
   },
 }));
 
@@ -433,16 +489,54 @@ app.get('/api/backup/full', requireAuth, requireRole('Zarząd'), async (req, res
   const tables = {
     firefighters: 'firefighters', vehicles: 'vehicles', fuel: 'fuel_log', gear: 'gear',
     trips: 'trips', schedule: 'schedule', dues: 'dues', mdpMembers: 'mdp_members',
-    mdpMeetings: 'mdp_meetings', tasks: 'tasks',
+    mdpMeetings: 'mdp_meetings', tasks: 'tasks', announcements: 'announcements', sections: 'sections',
   };
   const data = {};
   for (const [key, table] of Object.entries(tables)) {
     data[key] = await dbAll(`SELECT * FROM ${table} WHERE unit_id = $1`, [unitId]);
   }
   data.users = await dbAll(`SELECT id, name, email, role FROM users WHERE unit_id = $1`, [unitId]);
+  data.sectionMembers = await dbAll(`SELECT * FROM section_members WHERE unit_id = $1`, [unitId]);
   data.auditLog = await dbAll(`SELECT * FROM audit_log WHERE unit_id = $1 ORDER BY ts DESC LIMIT 300`, [unitId]);
   const unit = await dbGet(`SELECT * FROM units WHERE id = $1`, [unitId]);
   res.json({ app: 'Firefighter24', exportedAt: new Date().toISOString(), unit, data });
+});
+
+/* ---------- PANEL ADMINISTRATORA PLATFORMY ----------
+   To jest celowo ODDZIELONE od ról w obrębie jednostek (Zarząd/Skarbnik/
+   Strażak) — te są zamknięte w swojej jednostce i tak powinno zostać.
+   Ten dostęp jest dla operatora całej platformy (Ciebie), żeby widzieć
+   wszystkie zarejestrowane jednostki naraz. Zabezpieczony osobnym sekretem
+   w nagłówku, nie tokenem JWT żadnego użytkownika. Jeśli ADMIN_SECRET nie
+   jest ustawiony w zmiennych środowiskowych, ten panel jest całkowicie
+   wyłączony (nie działa "otwarty", tylko odmawia dostępu). */
+const adminLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Zbyt wiele prób. Spróbuj ponownie za kilka minut.' },
+});
+function requireAdminSecret(req, res, next) {
+  const secret = process.env.ADMIN_SECRET;
+  if (!secret) return res.status(503).json({ error: 'Panel administratora nie jest skonfigurowany (brak ADMIN_SECRET w zmiennych środowiskowych).' });
+  const provided = req.headers['x-admin-secret'];
+  if (!provided || provided !== secret) return res.status(401).json({ error: 'Nieprawidłowy klucz administratora.' });
+  next();
+}
+
+app.get('/api/admin/units', adminLimiter, requireAdminSecret, async (req, res) => {
+  const rows = await dbAll(`
+    SELECT
+      u.id,
+      u.name,
+      u.created_at,
+      (SELECT COUNT(*) FROM users WHERE unit_id = u.id)::int AS user_count,
+      (SELECT COUNT(*) FROM firefighters WHERE unit_id = u.id)::int AS firefighter_count
+    FROM units u
+    ORDER BY u.created_at DESC
+  `);
+  res.json(rows);
 });
 
 app.get('/api/health', async (req, res) => {
