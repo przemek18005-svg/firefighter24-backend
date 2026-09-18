@@ -72,7 +72,7 @@ app.post('/api/auth/register', authLimiter, validateBody({
 
   const unitId = uuid();
   const userId = uuid();
-  const passwordHash = bcrypt.hashSync(password, 12);
+  const passwordHash = await bcrypt.hash(password, 12);
 
   const client = await pool.connect();
   try {
@@ -108,7 +108,7 @@ app.post('/api/auth/login', strictAuthLimiter, validateBody({
   const emailLower = email.trim().toLowerCase();
   const user = await dbGet(`SELECT * FROM users WHERE email = $1`, [emailLower]);
   if (!user) return res.status(401).json({ error: 'Nie znaleziono konta z tym adresem e-mail.' });
-  if (!bcrypt.compareSync(password, user.password_hash)) {
+  if (!(await bcrypt.compare(password, user.password_hash))) {
     return res.status(401).json({ error: 'Nieprawidłowe hasło.' });
   }
   const unit = await dbGet(`SELECT * FROM units WHERE id = $1`, [user.unit_id]);
@@ -148,8 +148,13 @@ app.post('/api/auth/forgot-password', strictAuthLimiter, validateBody({
   });
   await logAudit(user.unit_id, user.name, 'Poproszono o reset hasła', emailResult.devMode ? '(tryb dev — brak RESEND_API_KEY)' : '');
 
-  if (emailResult.devMode) {
-    return res.json({ ...genericOk, devToken: rawToken, devNote: 'RESEND_API_KEY nie jest ustawiony — token zwrócony tylko do celów testowych.' });
+  // Token w odpowiedzi JSON pokazujemy WYŁĄCZNIE, gdy ktoś świadomie ustawił
+  // NODE_ENV=development (np. do testów lokalnych) — nie samym brakiem
+  // RESEND_API_KEY/SMTP_HOST. To druga, niezależna warstwa zabezpieczenia:
+  // nawet jeśli poczta zostanie przypadkiem źle skonfigurowana na prawdziwym
+  // serwerze, token i tak nie wycieknie, dopóki ktoś jawnie nie włączy trybu dev.
+  if (emailResult.devMode && process.env.NODE_ENV === 'development') {
+    return res.json({ ...genericOk, devToken: rawToken, devNote: 'RESEND_API_KEY nie jest ustawiony — token zwrócony tylko do celów testowych (NODE_ENV=development).' });
   }
   res.json(genericOk);
 });
@@ -174,7 +179,7 @@ app.post('/api/auth/reset-password', strictAuthLimiter, validateBody({
     return res.status(400).json({ error: 'Link wygasł. Poproś o nowy reset hasła.' });
   }
 
-  const passwordHash = bcrypt.hashSync(newPassword, 12);
+  const passwordHash = await bcrypt.hash(newPassword, 12);
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -430,9 +435,10 @@ app.post('/api/users', requireAuth, requireRole('Zarząd'), validateBody({
     return res.status(409).json({ error: 'Konto z tym adresem e-mail już istnieje.' });
   }
   const id = uuid();
+  const passwordHash = await bcrypt.hash(password, 12);
   await dbRun(
     `INSERT INTO users (id, unit_id, name, email, password_hash, role) VALUES ($1,$2,$3,$4,$5,$6)`,
-    [id, req.user.unitId, name.trim(), emailLower, bcrypt.hashSync(password, 12), role]
+    [id, req.user.unitId, name.trim(), emailLower, passwordHash, role]
   );
   await logAudit(req.user.unitId, req.user.name, 'Utworzono konto użytkownika', `${name} (${role})`);
   res.status(201).json({ id, name: name.trim(), email: emailLower, role });
@@ -452,7 +458,7 @@ app.put('/api/users/:id', requireAuth, requireRole('Zarząd'), validateBody({
     const clash = await dbGet(`SELECT id FROM users WHERE email = $1 AND id != $2`, [emailLower, req.params.id]);
     if (clash) return res.status(409).json({ error: 'Ten adres e-mail jest już używany przez inne konto.' });
   }
-  const passwordHash = password ? bcrypt.hashSync(password, 12) : target.password_hash;
+  const passwordHash = password ? await bcrypt.hash(password, 12) : target.password_hash;
   const emailLower = (email || target.email).trim().toLowerCase();
   await dbRun(
     `UPDATE users SET name=$1, email=$2, password_hash=$3, role=$4 WHERE id=$5`,
