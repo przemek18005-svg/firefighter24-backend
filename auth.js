@@ -2,6 +2,7 @@
 // KLUCZOWA RÓŻNICA wobec wersji front-endowej: te sprawdzenia ról dzieją się
 // na serwerze, więc nie da się ich obejść konsolą przeglądarki.
 const jwt = require('jsonwebtoken');
+const { pool } = require('./db');
 
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) {
@@ -28,21 +29,43 @@ function signGminaToken(account) {
   );
 }
 
-function requireAuth(req, res, next) {
+/* requireAuth celowo NIE ufa roli/uprawnieniom zapisanym w samym tokenie —
+   token może żyć 30 dni, a Zarząd musi móc natychmiast zmienić komuś rolę,
+   nadać/cofnąć uprawnienie albo usunąć konto i mieć pewność, że to działa
+   od razu, a nie dopiero po ponownym zalogowaniu tamtej osoby. Dlatego przy
+   każdym żądaniu dociągamy świeże role+permissions z bazy — token służy
+   tylko do potwierdzenia TOŻSAMOŚCI (kim jest ten użytkownik), nie do
+   przechowywania jego bieżących uprawnień. */
+async function requireAuth(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'Brak tokenu uwierzytelniającego.' });
+  let payload;
   try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    // Tokeny wydane przed wprowadzeniem tego rozróżnienia nie mają pola "kind"
-    // — traktujemy brak pola jak "unit", żeby nie wylogować wszystkich
-    // dotychczasowych użytkowników przy tym wdrożeniu. Odrzucamy tylko
-    // token jawnie oznaczony jako inny rodzaj (np. "gmina").
-    if (payload.kind && payload.kind !== 'unit') return res.status(401).json({ error: 'Nieprawidłowy typ tokenu.' });
-    req.user = { id: payload.sub, unitId: payload.unitId, role: payload.role, name: payload.name, email: payload.email };
-    next();
+    payload = jwt.verify(token, JWT_SECRET);
   } catch (e) {
     return res.status(401).json({ error: 'Token nieprawidłowy lub wygasł. Zaloguj się ponownie.' });
+  }
+  // Tokeny wydane przed wprowadzeniem tego rozróżnienia nie mają pola "kind"
+  // — traktujemy brak pola jak "unit", żeby nie wylogować wszystkich
+  // dotychczasowych użytkowników przy tym wdrożeniu. Odrzucamy tylko
+  // token jawnie oznaczony jako inny rodzaj (np. "gmina").
+  if (payload.kind && payload.kind !== 'unit') return res.status(401).json({ error: 'Nieprawidłowy typ tokenu.' });
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, unit_id, name, email, role, permissions FROM users WHERE id = $1`,
+      [payload.sub]
+    );
+    const dbUser = rows[0];
+    if (!dbUser) return res.status(401).json({ error: 'Konto nie istnieje. Zaloguj się ponownie.' });
+    req.user = {
+      id: dbUser.id, unitId: dbUser.unit_id, role: dbUser.role,
+      name: dbUser.name, email: dbUser.email, permissions: dbUser.permissions || {},
+    };
+    next();
+  } catch (e) {
+    console.error('Błąd weryfikacji sesji:', e.message);
+    return res.status(500).json({ error: 'Błąd serwera podczas weryfikacji sesji.' });
   }
 }
 
@@ -69,4 +92,18 @@ function requireRole(...allowedRoles) {
   };
 }
 
-module.exports = { signToken, signGminaToken, requireAuth, requireGminaAuth, requireRole, JWT_SECRET };
+/* requireRoleOrPermission: dostęp mają role wymienione w allowedRoles ORAZ
+   każdy, komu Zarząd nadał konkretną, nazwaną flagę uprawnienia (niezależnie
+   od jego roli bazowej). Zarząd zawsze przechodzi automatycznie — jest
+   pełnoprawnym administratorem jednostki niezależnie od tych flag. */
+function requireRoleOrPermission(allowedRoles, permissionFlag) {
+  return (req, res, next) => {
+    if (!req.user) return res.status(401).json({ error: 'Brak tokenu uwierzytelniającego.' });
+    if (req.user.role === 'Zarząd') return next();
+    if (allowedRoles.includes(req.user.role)) return next();
+    if (permissionFlag && req.user.permissions && req.user.permissions[permissionFlag] === true) return next();
+    return res.status(403).json({ error: 'Nie masz uprawnień do wykonania tej operacji.' });
+  };
+}
+
+module.exports = { signToken, signGminaToken, requireAuth, requireGminaAuth, requireRole, requireRoleOrPermission, JWT_SECRET };

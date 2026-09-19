@@ -10,7 +10,7 @@ const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const { v4: uuid } = require('uuid');
 const { pool, initSchema } = require('./db');
-const { signToken, signGminaToken, requireAuth, requireGminaAuth, requireRole } = require('./auth');
+const { signToken, signGminaToken, requireAuth, requireGminaAuth, requireRole, requireRoleOrPermission } = require('./auth');
 const { validateBody } = require('./validation');
 const { sendEmail, EMAIL_CONFIGURED, EMAIL_MODE } = require('./email');
 
@@ -95,7 +95,7 @@ app.post('/api/auth/register', authLimiter, validateBody({
 
   res.status(201).json({
     token: signToken({ id: userId, unit_id: unitId, name: name.trim(), email: emailLower, role: 'Zarząd' }),
-    user: { id: userId, name: name.trim(), email: emailLower, role: 'Zarząd' },
+    user: { id: userId, name: name.trim(), email: emailLower, role: 'Zarząd', permissions: {} },
     unit: { id: unitId, name: unitName.trim(), gminaCode: null },
   });
 });
@@ -115,7 +115,7 @@ app.post('/api/auth/login', strictAuthLimiter, validateBody({
   await logAudit(user.unit_id, user.name, 'Zalogowano się', user.email);
   res.json({
     token: signToken(user),
-    user: { id: user.id, name: user.name, email: user.email, role: user.role },
+    user: { id: user.id, name: user.name, email: user.email, role: user.role, permissions: user.permissions || {} },
     unit: { id: unit.id, name: unit.name, gminaCode: unit.gmina_code },
   });
 });
@@ -197,26 +197,31 @@ app.post('/api/auth/reset-password', strictAuthLimiter, validateBody({
 });
 
 app.get('/api/me', requireAuth, async (req, res) => {
-  const user = await dbGet(`SELECT id, name, email, role FROM users WHERE id = $1`, [req.user.id]);
+  const user = await dbGet(`SELECT id, name, email, role, permissions FROM users WHERE id = $1`, [req.user.id]);
   const unit = await dbGet(`SELECT id, name, gmina_code FROM units WHERE id = $1`, [req.user.unitId]);
-  res.json({ user, unit: { id: unit.id, name: unit.name, gminaCode: unit.gmina_code } });
+  res.json({ user: { ...user, permissions: user.permissions || {} }, unit: { id: unit.id, name: unit.name, gminaCode: unit.gmina_code } });
 });
 
 /* ---------- POMOCNICZY GENERATOR TRAS CRUD ----------
    Każdy zasób jednostki (strażacy, sprzęt, pojazdy...) ma ten sam kształt:
    lista/dodaj/edytuj/usuń, zawsze filtrowane po unit_id z tokenu. */
-function crudRoutes({ table, fields, writeRoles, auditLabel, rules }) {
+function crudRoutes({ table, fields, readRoles, writeRoles, permissionFlag, auditLabel, rules }) {
   const router = express.Router();
   const validator = rules ? validateBody(rules) : (req, res, next) => next();
+  // Domyślnie odczyt mają wszystkie role jednostki, chyba że moduł jawnie
+  // ogranicza go (np. Flota, Sprzęt) — permissionFlag pozwala Zarządowi
+  // nadać dostęp pojedynczej osobie mimo jej roli bazowej.
+  const canRead = requireRoleOrPermission(readRoles || ['Zarząd', 'Skarbnik', 'Strażak'], permissionFlag);
+  const canWrite = requireRoleOrPermission(writeRoles, permissionFlag);
 
-  router.get('/', requireAuth, async (req, res) => {
+  router.get('/', requireAuth, canRead, async (req, res) => {
     try {
       const rows = await dbAll(`SELECT * FROM ${table} WHERE unit_id = $1`, [req.user.unitId]);
       res.json(rows);
     } catch (e) { res.status(500).json({ error: 'Błąd odczytu danych.' }); }
   });
 
-  router.post('/', requireAuth, requireRole(...writeRoles), validator, async (req, res) => {
+  router.post('/', requireAuth, canWrite, validator, async (req, res) => {
     try {
       const id = uuid();
       const cols = ['id', 'unit_id', ...fields];
@@ -231,7 +236,7 @@ function crudRoutes({ table, fields, writeRoles, auditLabel, rules }) {
     } catch (e) { console.error(e.message); res.status(500).json({ error: 'Błąd zapisu danych.' }); }
   });
 
-  router.put('/:id', requireAuth, requireRole(...writeRoles), validator, async (req, res) => {
+  router.put('/:id', requireAuth, canWrite, validator, async (req, res) => {
     try {
       const values = fields.map(f => req.body[f] ?? null);
       const setClause = fields.map((f, i) => `${f} = $${i + 1}`).join(', ');
@@ -245,7 +250,7 @@ function crudRoutes({ table, fields, writeRoles, auditLabel, rules }) {
     } catch (e) { console.error(e.message); res.status(500).json({ error: 'Błąd zapisu danych.' }); }
   });
 
-  router.delete('/:id', requireAuth, requireRole(...writeRoles), async (req, res) => {
+  router.delete('/:id', requireAuth, canWrite, async (req, res) => {
     try {
       const row = await dbGet(
         `DELETE FROM ${table} WHERE id = $1 AND unit_id = $2 RETURNING id`,
@@ -262,7 +267,7 @@ function crudRoutes({ table, fields, writeRoles, auditLabel, rules }) {
 
 app.use('/api/firefighters', crudRoutes({
   table: 'firefighters', fields: ['first', 'last', 'role', 'join_date', 'med_date', 'org_body', 'org_role'],
-  writeRoles: ['Zarząd'], auditLabel: 'strażak',
+  readRoles: ['Zarząd', 'Strażak'], writeRoles: ['Zarząd'], permissionFlag: 'firefighters', auditLabel: 'strażak',
   rules: {
     first: { required: true, type: 'string', max: 100 },
     last: { required: true, type: 'string', max: 100 },
@@ -276,7 +281,7 @@ app.use('/api/firefighters', crudRoutes({
 
 app.use('/api/sections', crudRoutes({
   table: 'sections', fields: ['name'],
-  writeRoles: ['Zarząd'], auditLabel: 'sekcja',
+  writeRoles: ['Zarząd'], permissionFlag: 'structure', auditLabel: 'sekcja',
   rules: { name: { required: true, type: 'string', max: 150 } },
 }));
 
@@ -292,7 +297,7 @@ app.get('/api/section-members', requireAuth, async (req, res) => {
   res.json(rows);
 });
 
-app.post('/api/section-members', requireAuth, requireRole('Zarząd'), validateBody({
+app.post('/api/section-members', requireAuth, requireRoleOrPermission(['Zarząd'], 'structure'), validateBody({
   section_id: { required: true, type: 'string', max: 100 },
   firefighter_id: { required: true, type: 'string', max: 100 },
 }), async (req, res) => {
@@ -312,7 +317,7 @@ app.post('/api/section-members', requireAuth, requireRole('Zarząd'), validateBo
   res.status(201).json({ id, section_id, firefighter_id, commander: commander ? 1 : 0, first: ff.first, last: ff.last });
 });
 
-app.delete('/api/section-members/:id', requireAuth, requireRole('Zarząd'), async (req, res) => {
+app.delete('/api/section-members/:id', requireAuth, requireRoleOrPermission(['Zarząd'], 'structure'), async (req, res) => {
   const row = await dbGet(`DELETE FROM section_members WHERE id = $1 AND unit_id = $2 RETURNING id`, [req.params.id, req.user.unitId]);
   if (!row) return res.status(404).json({ error: 'Nie znaleziono przypisania.' });
   await logAudit(req.user.unitId, req.user.name, 'Usunięto z sekcji', '');
@@ -321,7 +326,7 @@ app.delete('/api/section-members/:id', requireAuth, requireRole('Zarząd'), asyn
 
 app.use('/api/vehicles', crudRoutes({
   table: 'vehicles', fields: ['name', 'plate', 'oc_date', 'review_date', 'mileage'],
-  writeRoles: ['Zarząd'], auditLabel: 'pojazd',
+  readRoles: ['Zarząd'], writeRoles: ['Zarząd'], permissionFlag: 'fleet', auditLabel: 'pojazd',
   rules: {
     name: { required: true, type: 'string', max: 150 },
     plate: { type: 'string', max: 30 },
@@ -333,7 +338,7 @@ app.use('/api/vehicles', crudRoutes({
 
 app.use('/api/fuel', crudRoutes({
   table: 'fuel_log', fields: ['vehicle_id', 'vehicle_name', 'date', 'liters', 'cost'],
-  writeRoles: ['Zarząd'], auditLabel: 'tankowanie',
+  readRoles: ['Zarząd'], writeRoles: ['Zarząd'], permissionFlag: 'fleet', auditLabel: 'tankowanie',
   rules: {
     date: { required: true, type: 'date' },
     liters: { required: true, type: 'positiveNumber' },
@@ -343,7 +348,7 @@ app.use('/api/fuel', crudRoutes({
 
 app.use('/api/gear', crudRoutes({
   table: 'gear', fields: ['name', 'category', 'review_date'],
-  writeRoles: ['Zarząd'], auditLabel: 'sprzęt',
+  readRoles: ['Zarząd'], writeRoles: ['Zarząd'], permissionFlag: 'gear', auditLabel: 'sprzęt',
   rules: {
     name: { required: true, type: 'string', max: 150 },
     review_date: { type: 'date' },
@@ -352,7 +357,7 @@ app.use('/api/gear', crudRoutes({
 
 app.use('/api/trips', crudRoutes({
   table: 'trips', fields: ['date', 'type', 'place', 'crew', 'lat', 'lng'],
-  writeRoles: ['Zarząd'], auditLabel: 'wyjazd',
+  readRoles: ['Zarząd'], writeRoles: ['Zarząd'], permissionFlag: 'trips', auditLabel: 'wyjazd',
   rules: {
     date: { required: true, type: 'date' },
     place: { type: 'string', max: 200 },
@@ -361,7 +366,7 @@ app.use('/api/trips', crudRoutes({
 
 app.use('/api/schedule', crudRoutes({
   table: 'schedule', fields: ['type', 'date', 'description'],
-  writeRoles: ['Zarząd'], auditLabel: 'wydarzenie w terminarzu',
+  writeRoles: ['Zarząd'], permissionFlag: 'schedule', auditLabel: 'wydarzenie w terminarzu',
   rules: {
     date: { required: true, type: 'date' },
     description: { type: 'string', max: 500 },
@@ -370,7 +375,7 @@ app.use('/api/schedule', crudRoutes({
 
 app.use('/api/dues', crudRoutes({
   table: 'dues', fields: ['firefighter_id', 'firefighter_name', 'month', 'amount', 'status'],
-  writeRoles: ['Zarząd', 'Skarbnik'], auditLabel: 'wpłata składki',
+  writeRoles: ['Zarząd', 'Skarbnik'], permissionFlag: 'dues', auditLabel: 'wpłata składki',
   rules: {
     month: { required: true, type: 'month' },
     amount: { required: true, type: 'positiveNumber' },
@@ -380,7 +385,7 @@ app.use('/api/dues', crudRoutes({
 
 app.use('/api/mdp-members', crudRoutes({
   table: 'mdp_members', fields: ['first', 'last', 'dob'],
-  writeRoles: ['Zarząd'], auditLabel: 'członek MDP',
+  readRoles: ['Zarząd'], writeRoles: ['Zarząd'], permissionFlag: 'mdp', auditLabel: 'członek MDP',
   rules: {
     first: { required: true, type: 'string', max: 100 },
     last: { required: true, type: 'string', max: 100 },
@@ -390,7 +395,7 @@ app.use('/api/mdp-members', crudRoutes({
 
 app.use('/api/mdp-meetings', crudRoutes({
   table: 'mdp_meetings', fields: ['date', 'topic', 'present'],
-  writeRoles: ['Zarząd'], auditLabel: 'zebranie MDP',
+  readRoles: ['Zarząd'], writeRoles: ['Zarząd'], permissionFlag: 'mdp', auditLabel: 'zebranie MDP',
   rules: {
     date: { required: true, type: 'date' },
     present: { type: 'nonNegativeNumber' },
@@ -408,10 +413,11 @@ app.use('/api/tasks', crudRoutes({
   },
 }));
 
-// Ogłoszenia: czyta cała jednostka, publikuje i usuwa tylko Zarząd.
+// Ogłoszenia: czyta cała jednostka, publikuje i usuwa tylko Zarząd (albo
+// osoba z jawnie nadaną flagą 'announcements').
 app.use('/api/announcements', crudRoutes({
   table: 'announcements', fields: ['title', 'body', 'author_name', 'pinned'],
-  writeRoles: ['Zarząd'], auditLabel: 'ogłoszenie',
+  writeRoles: ['Zarząd'], permissionFlag: 'announcements', auditLabel: 'ogłoszenie',
   rules: {
     title: { required: true, type: 'string', max: 200 },
   },
@@ -419,10 +425,10 @@ app.use('/api/announcements', crudRoutes({
 
 // Ćwiczenia: osobny moduł od Wyjazdów — szkolenia i treningi jednostki,
 // z frekwencją i czasem trwania. Widoczne dla wszystkich ról (jak Terminarz),
-// zapis tylko Zarząd.
+// zapis tylko Zarząd (albo osoba z flagą 'exercises').
 app.use('/api/exercises', crudRoutes({
   table: 'exercises', fields: ['date', 'topic', 'type', 'duration_hours', 'participants', 'notes'],
-  writeRoles: ['Zarząd'], auditLabel: 'ćwiczenie',
+  writeRoles: ['Zarząd'], permissionFlag: 'exercises', auditLabel: 'ćwiczenie',
   rules: {
     date: { required: true, type: 'date' },
     topic: { type: 'string', max: 200 },
@@ -508,8 +514,14 @@ app.get('/api/gmina/overview', requireGminaAuth, async (req, res) => {
 });
 
 // ---------- KONTA UŻYTKOWNIKÓW ----------
+// Uprawnienia, które Zarząd może nadać pojedynczej osobie niezależnie od jej
+// roli bazowej — każda flaga daje pełny (odczyt+zapis) dostęp do jednego
+// modułu. Konta i Historia są celowo NIE do nadania — to zawsze wyłącznie
+// Zarząd, bo dotyczą zarządzania innymi kontami i pełnego dziennika zdarzeń.
+const GRANTABLE_PERMISSIONS = ['firefighters', 'fleet', 'gear', 'trips', 'schedule', 'dues', 'mdp', 'structure', 'exercises', 'announcements'];
+
 app.get('/api/users', requireAuth, requireRole('Zarząd'), async (req, res) => {
-  const rows = await dbAll(`SELECT id, name, email, role FROM users WHERE unit_id = $1`, [req.user.unitId]);
+  const rows = await dbAll(`SELECT id, name, email, role, permissions FROM users WHERE unit_id = $1`, [req.user.unitId]);
   res.json(rows);
 });
 
@@ -531,7 +543,7 @@ app.post('/api/users', requireAuth, requireRole('Zarząd'), validateBody({
     [id, req.user.unitId, name.trim(), emailLower, passwordHash, role]
   );
   await logAudit(req.user.unitId, req.user.name, 'Utworzono konto użytkownika', `${name} (${role})`);
-  res.status(201).json({ id, name: name.trim(), email: emailLower, role });
+  res.status(201).json({ id, name: name.trim(), email: emailLower, role, permissions: {} });
 });
 
 app.put('/api/users/:id', requireAuth, requireRole('Zarząd'), validateBody({
@@ -556,6 +568,23 @@ app.put('/api/users/:id', requireAuth, requireRole('Zarząd'), validateBody({
   );
   await logAudit(req.user.unitId, req.user.name, 'Edytowano konto użytkownika', name || target.name);
   res.json({ ok: true });
+});
+
+// Nadawanie/cofanie granularnych uprawnień — osobna trasa od edycji samego
+// konta, bo to inny rodzaj decyzji (co ta osoba może robić, nie kim jest).
+// Wejściowy obiekt jest czyszczony do wyłącznie znanych, dozwolonych flag —
+// nikt nie wstrzyknie tu dowolnego klucza z ciała żądania.
+app.put('/api/users/:id/permissions', requireAuth, requireRole('Zarząd'), async (req, res) => {
+  const target = await dbGet(`SELECT id, name, role FROM users WHERE id = $1 AND unit_id = $2`, [req.params.id, req.user.unitId]);
+  if (!target) return res.status(404).json({ error: 'Nie znaleziono konta.' });
+  const input = (req.body && typeof req.body.permissions === 'object' && !Array.isArray(req.body.permissions)) ? req.body.permissions : {};
+  const clean = {};
+  for (const key of GRANTABLE_PERMISSIONS) {
+    if (input[key] === true) clean[key] = true;
+  }
+  await dbRun(`UPDATE users SET permissions = $1 WHERE id = $2`, [JSON.stringify(clean), req.params.id]);
+  await logAudit(req.user.unitId, req.user.name, 'Zmieniono uprawnienia konta', `${target.name}: ${Object.keys(clean).join(', ') || 'brak dodatkowych uprawnień'}`);
+  res.json({ ok: true, permissions: clean });
 });
 
 app.delete('/api/users/:id', requireAuth, requireRole('Zarząd'), async (req, res) => {

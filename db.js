@@ -39,6 +39,7 @@ async function initSchema() {
       email TEXT NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
       role TEXT NOT NULL CHECK(role IN ('Zarząd','Skarbnik','Strażak')),
+      permissions JSONB NOT NULL DEFAULT '{}'::jsonb,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
@@ -237,6 +238,7 @@ async function initSchema() {
     ALTER TABLE firefighters ADD COLUMN IF NOT EXISTS org_role TEXT;
     ALTER TABLE units ADD COLUMN IF NOT EXISTS gmina_code TEXT;
     CREATE INDEX IF NOT EXISTS idx_units_gmina_code ON units(gmina_code);
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions JSONB NOT NULL DEFAULT '{}'::jsonb;
   `);
 }
 
