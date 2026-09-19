@@ -28,6 +28,7 @@ async function initSchema() {
     CREATE TABLE IF NOT EXISTS units (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
+      gmina_code TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
@@ -181,18 +182,24 @@ async function initSchema() {
       commander INTEGER NOT NULL DEFAULT 0
     );
 
-    CREATE TABLE IF NOT EXISTS sections (
+    CREATE TABLE IF NOT EXISTS exercises (
       id TEXT PRIMARY KEY,
       unit_id TEXT NOT NULL REFERENCES units(id) ON DELETE CASCADE,
-      name TEXT NOT NULL
+      date TEXT NOT NULL,
+      topic TEXT,
+      type TEXT,
+      duration_hours REAL,
+      participants INTEGER,
+      notes TEXT
     );
 
-    CREATE TABLE IF NOT EXISTS section_members (
+    CREATE TABLE IF NOT EXISTS gmina_accounts (
       id TEXT PRIMARY KEY,
-      unit_id TEXT NOT NULL REFERENCES units(id) ON DELETE CASCADE,
-      section_id TEXT NOT NULL REFERENCES sections(id) ON DELETE CASCADE,
-      firefighter_id TEXT NOT NULL REFERENCES firefighters(id) ON DELETE CASCADE,
-      commander INTEGER NOT NULL DEFAULT 0
+      gmina_code TEXT NOT NULL,
+      name TEXT NOT NULL,
+      email TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
     CREATE INDEX IF NOT EXISTS idx_firefighters_unit ON firefighters(unit_id);
@@ -212,9 +219,8 @@ async function initSchema() {
     CREATE INDEX IF NOT EXISTS idx_section_members_unit ON section_members(unit_id);
     CREATE INDEX IF NOT EXISTS idx_section_members_section ON section_members(section_id);
     CREATE INDEX IF NOT EXISTS idx_section_members_firefighter ON section_members(firefighter_id);
-    CREATE INDEX IF NOT EXISTS idx_sections_unit ON sections(unit_id);
-    CREATE INDEX IF NOT EXISTS idx_section_members_unit ON section_members(unit_id);
-    CREATE INDEX IF NOT EXISTS idx_section_members_section ON section_members(section_id);
+    CREATE INDEX IF NOT EXISTS idx_exercises_unit ON exercises(unit_id);
+    CREATE INDEX IF NOT EXISTS idx_gmina_accounts_code ON gmina_accounts(gmina_code);
   `);
 
   /* ---------- MIGRACJE: dopisywanie kolumn do tabel, które już istniały ----------
@@ -229,6 +235,8 @@ async function initSchema() {
     ALTER TABLE trips ADD COLUMN IF NOT EXISTS lng REAL;
     ALTER TABLE firefighters ADD COLUMN IF NOT EXISTS org_body TEXT;
     ALTER TABLE firefighters ADD COLUMN IF NOT EXISTS org_role TEXT;
+    ALTER TABLE units ADD COLUMN IF NOT EXISTS gmina_code TEXT;
+    CREATE INDEX IF NOT EXISTS idx_units_gmina_code ON units(gmina_code);
   `);
 }
 

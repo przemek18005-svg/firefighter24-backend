@@ -10,7 +10,7 @@ const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const { v4: uuid } = require('uuid');
 const { pool, initSchema } = require('./db');
-const { signToken, requireAuth, requireRole } = require('./auth');
+const { signToken, signGminaToken, requireAuth, requireGminaAuth, requireRole } = require('./auth');
 const { validateBody } = require('./validation');
 const { sendEmail, EMAIL_CONFIGURED, EMAIL_MODE } = require('./email');
 
@@ -96,7 +96,7 @@ app.post('/api/auth/register', authLimiter, validateBody({
   res.status(201).json({
     token: signToken({ id: userId, unit_id: unitId, name: name.trim(), email: emailLower, role: 'Zarząd' }),
     user: { id: userId, name: name.trim(), email: emailLower, role: 'Zarząd' },
-    unit: { id: unitId, name: unitName.trim() },
+    unit: { id: unitId, name: unitName.trim(), gminaCode: null },
   });
 });
 
@@ -116,7 +116,7 @@ app.post('/api/auth/login', strictAuthLimiter, validateBody({
   res.json({
     token: signToken(user),
     user: { id: user.id, name: user.name, email: user.email, role: user.role },
-    unit: { id: unit.id, name: unit.name },
+    unit: { id: unit.id, name: unit.name, gminaCode: unit.gmina_code },
   });
 });
 
@@ -198,8 +198,8 @@ app.post('/api/auth/reset-password', strictAuthLimiter, validateBody({
 
 app.get('/api/me', requireAuth, async (req, res) => {
   const user = await dbGet(`SELECT id, name, email, role FROM users WHERE id = $1`, [req.user.id]);
-  const unit = await dbGet(`SELECT id, name FROM units WHERE id = $1`, [req.user.unitId]);
-  res.json({ user, unit });
+  const unit = await dbGet(`SELECT id, name, gmina_code FROM units WHERE id = $1`, [req.user.unitId]);
+  res.json({ user, unit: { id: unit.id, name: unit.name, gminaCode: unit.gmina_code } });
 });
 
 /* ---------- POMOCNICZY GENERATOR TRAS CRUD ----------
@@ -417,6 +417,96 @@ app.use('/api/announcements', crudRoutes({
   },
 }));
 
+// Ćwiczenia: osobny moduł od Wyjazdów — szkolenia i treningi jednostki,
+// z frekwencją i czasem trwania. Widoczne dla wszystkich ról (jak Terminarz),
+// zapis tylko Zarząd.
+app.use('/api/exercises', crudRoutes({
+  table: 'exercises', fields: ['date', 'topic', 'type', 'duration_hours', 'participants', 'notes'],
+  writeRoles: ['Zarząd'], auditLabel: 'ćwiczenie',
+  rules: {
+    date: { required: true, type: 'date' },
+    topic: { type: 'string', max: 200 },
+    duration_hours: { type: 'nonNegativeNumber' },
+    participants: { type: 'nonNegativeNumber' },
+  },
+}));
+
+// ---------- USTAWIENIA JEDNOSTKI ----------
+// Kod gminy — dowolny, wspólny ciąg znaków, który Zarząd ustala samodzielnie.
+// Jednostki z tym samym kodem grupują się razem w panelu gminy (patrz niżej).
+app.put('/api/unit/settings', requireAuth, requireRole('Zarząd'), validateBody({
+  gmina_code: { type: 'string', max: 100 },
+}), async (req, res) => {
+  const gminaCode = (req.body.gmina_code || '').trim() || null;
+  await dbRun(`UPDATE units SET gmina_code = $1 WHERE id = $2`, [gminaCode, req.user.unitId]);
+  await logAudit(req.user.unitId, req.user.name, 'Zmieniono ustawienia jednostki', gminaCode ? `kod gminy: ${gminaCode}` : 'usunięto kod gminy');
+  res.json({ ok: true, gminaCode });
+});
+
+/* ---------- PANEL GMINY ----------
+   Zupełnie osobny system logowania od kont jednostek — token ma inny "kind"
+   (patrz auth.js), więc token strażaka nigdy nie zadziała tutaj i odwrotnie.
+   Konto gminne widzi tylko ZAGREGOWANE liczby dla jednostek ze swoim kodem
+   gminy — nie ma dostępu do pełnych, szczegółowych danych żadnej jednostki
+   (żadnych nazwisk, żadnych operacyjnych szczegółów wyjazdów). To świadomy
+   wybór: nadzór na poziomie gminy nie powinien oznaczać podglądu wszystkiego. */
+app.post('/api/gmina/auth/register', authLimiter, validateBody({
+  gminaCode: { required: true, type: 'string', max: 100 },
+  name: { required: true, type: 'string', max: 200 },
+  email: { required: true, type: 'email' },
+  password: { required: true, type: 'password' },
+}), async (req, res) => {
+  const { name, password } = req.body;
+  const gminaCode = req.body.gminaCode.trim();
+  const emailLower = req.body.email.trim().toLowerCase();
+  const existing = await dbGet(`SELECT id FROM gmina_accounts WHERE email = $1`, [emailLower]);
+  if (existing) return res.status(409).json({ error: 'Konto z tym adresem e-mail już istnieje.' });
+
+  const id = uuid();
+  const passwordHash = await bcrypt.hash(password, 12);
+  await dbRun(
+    `INSERT INTO gmina_accounts (id, gmina_code, name, email, password_hash) VALUES ($1,$2,$3,$4,$5)`,
+    [id, gminaCode, name.trim(), emailLower, passwordHash]
+  );
+  const account = { id, gmina_code: gminaCode, name: name.trim(), email: emailLower };
+  res.status(201).json({ token: signGminaToken(account), account: { id, gminaCode, name: name.trim(), email: emailLower } });
+});
+
+app.post('/api/gmina/auth/login', strictAuthLimiter, validateBody({
+  email: { required: true, type: 'email' },
+  password: { required: true, type: 'string', max: 200 },
+}), async (req, res) => {
+  const emailLower = req.body.email.trim().toLowerCase();
+  const account = await dbGet(`SELECT * FROM gmina_accounts WHERE email = $1`, [emailLower]);
+  if (!account) return res.status(401).json({ error: 'Nie znaleziono konta z tym adresem e-mail.' });
+  if (!(await bcrypt.compare(req.body.password, account.password_hash))) {
+    return res.status(401).json({ error: 'Nieprawidłowe hasło.' });
+  }
+  res.json({
+    token: signGminaToken(account),
+    account: { id: account.id, gminaCode: account.gmina_code, name: account.name, email: account.email },
+  });
+});
+
+app.get('/api/gmina/overview', requireGminaAuth, async (req, res) => {
+  const units = await dbAll(`SELECT id, name, created_at FROM units WHERE gmina_code = $1 ORDER BY name`, [req.gmina.gminaCode]);
+  const overview = await Promise.all(units.map(async (unit) => {
+    const [firefighters, vehicles, gear, trips90d, exercises90d] = await Promise.all([
+      dbGet(`SELECT COUNT(*)::int AS n FROM firefighters WHERE unit_id = $1`, [unit.id]),
+      dbGet(`SELECT COUNT(*)::int AS n FROM vehicles WHERE unit_id = $1`, [unit.id]),
+      dbGet(`SELECT COUNT(*)::int AS n FROM gear WHERE unit_id = $1`, [unit.id]),
+      dbGet(`SELECT COUNT(*)::int AS n FROM trips WHERE unit_id = $1 AND date >= to_char(NOW() - INTERVAL '90 days', 'YYYY-MM-DD')`, [unit.id]),
+      dbGet(`SELECT COUNT(*)::int AS n FROM exercises WHERE unit_id = $1 AND date >= to_char(NOW() - INTERVAL '90 days', 'YYYY-MM-DD')`, [unit.id]),
+    ]);
+    return {
+      id: unit.id, name: unit.name, createdAt: unit.created_at,
+      firefighterCount: firefighters.n, vehicleCount: vehicles.n, gearCount: gear.n,
+      trips90d: trips90d.n, exercises90d: exercises90d.n,
+    };
+  }));
+  res.json({ gminaCode: req.gmina.gminaCode, units: overview });
+});
+
 // ---------- KONTA UŻYTKOWNIKÓW ----------
 app.get('/api/users', requireAuth, requireRole('Zarząd'), async (req, res) => {
   const rows = await dbAll(`SELECT id, name, email, role FROM users WHERE unit_id = $1`, [req.user.unitId]);
@@ -495,7 +585,7 @@ app.get('/api/backup/full', requireAuth, requireRole('Zarząd'), async (req, res
   const tables = {
     firefighters: 'firefighters', vehicles: 'vehicles', fuel: 'fuel_log', gear: 'gear',
     trips: 'trips', schedule: 'schedule', dues: 'dues', mdpMembers: 'mdp_members',
-    mdpMeetings: 'mdp_meetings', tasks: 'tasks', announcements: 'announcements', sections: 'sections',
+    mdpMeetings: 'mdp_meetings', tasks: 'tasks', announcements: 'announcements', sections: 'sections', exercises: 'exercises',
   };
   const data = {};
   for (const [key, table] of Object.entries(tables)) {
