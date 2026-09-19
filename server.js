@@ -41,6 +41,17 @@ async function logAudit(unitId, userName, action, details) {
   );
 }
 
+// Losowy kod gminy (24 znaki, duże/małe litery + cyfry) — generowany przez
+// serwer, nie wpisywany ręcznie, żeby uniknąć literówek, kolizji między
+// gminami i żeby ktoś z zewnątrz nie odgadł go łatwym słowem.
+function generateGminaCode(length = 24) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  const bytes = crypto.randomBytes(length);
+  let code = '';
+  for (let i = 0; i < length; i++) code += alphabet[bytes[i] % alphabet.length];
+  return code;
+}
+
 /* ---------- LIMIT PRÓB (rate limiting) ---------- */
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -457,16 +468,22 @@ app.put('/api/unit/settings', requireAuth, requireRole('Zarząd'), validateBody(
    (żadnych nazwisk, żadnych operacyjnych szczegółów wyjazdów). To świadomy
    wybór: nadzór na poziomie gminy nie powinien oznaczać podglądu wszystkiego. */
 app.post('/api/gmina/auth/register', authLimiter, validateBody({
-  gminaCode: { required: true, type: 'string', max: 100 },
   name: { required: true, type: 'string', max: 200 },
   email: { required: true, type: 'email' },
   password: { required: true, type: 'password' },
 }), async (req, res) => {
   const { name, password } = req.body;
-  const gminaCode = req.body.gminaCode.trim();
   const emailLower = req.body.email.trim().toLowerCase();
   const existing = await dbGet(`SELECT id FROM gmina_accounts WHERE email = $1`, [emailLower]);
   if (existing) return res.status(409).json({ error: 'Konto z tym adresem e-mail już istnieje.' });
+
+  let gminaCode = null;
+  for (let attempt = 0; attempt < 5 && !gminaCode; attempt++) {
+    const candidate = generateGminaCode(24);
+    const clash = await dbGet(`SELECT id FROM gmina_accounts WHERE gmina_code = $1`, [candidate]);
+    if (!clash) gminaCode = candidate;
+  }
+  if (!gminaCode) return res.status(500).json({ error: 'Nie udało się wygenerować unikalnego kodu gminy. Spróbuj ponownie.' });
 
   const id = uuid();
   const passwordHash = await bcrypt.hash(password, 12);
@@ -492,6 +509,38 @@ app.post('/api/gmina/auth/login', strictAuthLimiter, validateBody({
     token: signGminaToken(account),
     account: { id: account.id, gminaCode: account.gmina_code, name: account.name, email: account.email },
   });
+});
+
+/* Regeneracja kodu gminy na żądanie (przycisk w panelu). Celowo NIE zrywa
+   już podłączonych jednostek — razem z kontem(-ami) gminy przepisujemy też
+   wszystkie jednostki, które miały stary kod, na nowy, w jednej transakcji.
+   Token zwracany w odpowiedzi trzeba od razu podmienić po stronie
+   przeglądarki — stary token niesie już nieaktualny kod. */
+app.post('/api/gmina/regenerate-code', authLimiter, requireGminaAuth, async (req, res) => {
+  const oldCode = req.gmina.gminaCode;
+  let newCode = null;
+  for (let attempt = 0; attempt < 5 && !newCode; attempt++) {
+    const candidate = generateGminaCode(24);
+    const clash = await dbGet(`SELECT id FROM gmina_accounts WHERE gmina_code = $1`, [candidate]);
+    if (!clash) newCode = candidate;
+  }
+  if (!newCode) return res.status(500).json({ error: 'Nie udało się wygenerować nowego kodu. Spróbuj ponownie.' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`UPDATE gmina_accounts SET gmina_code = $1 WHERE gmina_code = $2`, [newCode, oldCode]);
+    await client.query(`UPDATE units SET gmina_code = $1 WHERE gmina_code = $2`, [newCode, oldCode]);
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('Błąd regeneracji kodu gminy:', e.message);
+    return res.status(500).json({ error: 'Nie udało się zaktualizować kodu. Spróbuj ponownie.' });
+  } finally {
+    client.release();
+  }
+  const freshAccount = { id: req.gmina.id, gmina_code: newCode, name: req.gmina.name, email: req.gmina.email };
+  res.json({ gminaCode: newCode, token: signGminaToken(freshAccount) });
 });
 
 app.get('/api/gmina/overview', requireGminaAuth, async (req, res) => {
