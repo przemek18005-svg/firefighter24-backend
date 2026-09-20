@@ -237,6 +237,18 @@ async function initSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
+    -- Zapotrzebowanie / zakupy: każdy zgłasza potrzebę, Zarząd zmienia status.
+    CREATE TABLE IF NOT EXISTS purchase_requests (
+      id TEXT PRIMARY KEY,
+      unit_id TEXT NOT NULL REFERENCES units(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      quantity INTEGER NOT NULL DEFAULT 1,
+      description TEXT,
+      status TEXT NOT NULL DEFAULT 'Nowe' CHECK(status IN ('Nowe','Zatwierdzone','Odrzucone','Zrealizowane')),
+      reported_by_name TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
     CREATE INDEX IF NOT EXISTS idx_firefighters_unit ON firefighters(unit_id);
     CREATE INDEX IF NOT EXISTS idx_vehicles_unit ON vehicles(unit_id);
     CREATE INDEX IF NOT EXISTS idx_gear_unit ON gear(unit_id);
@@ -294,6 +306,7 @@ async function initSchema() {
     ALTER TABLE trips ADD COLUMN IF NOT EXISTS attachment_data TEXT;
     CREATE INDEX IF NOT EXISTS idx_trip_vehicles_unit ON trip_vehicles(unit_id);
     CREATE INDEX IF NOT EXISTS idx_trip_vehicles_trip ON trip_vehicles(trip_id);
+    CREATE INDEX IF NOT EXISTS idx_purchase_requests_unit ON purchase_requests(unit_id);
   `);
 }
 

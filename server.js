@@ -587,6 +587,64 @@ app.use('/api/exercises', crudRoutes({
   },
 }));
 
+/* Zapotrzebowanie / zakupy — celowo NIE generyczny crudRoutes, bo zgłaszanie
+   potrzeby jest otwarte dla każdej roli (każdy strażak może zauważyć brak
+   sprzętu), a zmiana statusu/edycja/usunięcie to już decyzja Zarządu (albo
+   osoby z nadaną flagą 'purchases'). To asymetria, której generyczny
+   crudRoutes nie obsługuje (ten sam zestaw ról dla POST i PUT/DELETE). */
+const purchasePerm = requireRoleOrPermission(['Zarząd'], 'purchases');
+const purchaseCreateValidator = validateBody({
+  name: { required: true, type: 'string', max: 200 },
+  quantity: { type: 'positiveNumber' },
+  description: { type: 'string', max: 1000 },
+});
+// Przy edycji (PUT) `name` NIE jest wymagane — Zarząd często chce zmienić
+// tylko status, bez przepisywania całego zgłoszenia od nowa.
+const purchaseUpdateValidator = validateBody({
+  name: { type: 'string', max: 200 },
+  quantity: { type: 'positiveNumber' },
+  description: { type: 'string', max: 1000 },
+  status: { type: 'enum', enum: ['Nowe', 'Zatwierdzone', 'Odrzucone', 'Zrealizowane'] },
+});
+
+app.get('/api/purchases', requireAuth, async (req, res) => {
+  const rows = await dbAll(`SELECT * FROM purchase_requests WHERE unit_id = $1 ORDER BY created_at DESC`, [req.user.unitId]);
+  res.json(rows);
+});
+
+app.post('/api/purchases', requireAuth, purchaseCreateValidator, async (req, res) => {
+  const id = uuid();
+  const quantity = req.body.quantity ? Math.round(Number(req.body.quantity)) : 1;
+  await dbRun(
+    `INSERT INTO purchase_requests (id, unit_id, name, quantity, description, reported_by_name) VALUES ($1,$2,$3,$4,$5,$6)`,
+    [id, req.user.unitId, req.body.name.trim(), quantity, req.body.description || null, req.user.name]
+  );
+  const row = await dbGet(`SELECT * FROM purchase_requests WHERE id = $1`, [id]);
+  await logAudit(req.user.unitId, req.user.name, 'Zgłoszono zapotrzebowanie', req.body.name.trim());
+  res.status(201).json(row);
+});
+
+app.put('/api/purchases/:id', requireAuth, purchasePerm, purchaseUpdateValidator, async (req, res) => {
+  const existing = await dbGet(`SELECT * FROM purchase_requests WHERE id = $1 AND unit_id = $2`, [req.params.id, req.user.unitId]);
+  if (!existing) return res.status(404).json({ error: 'Nie znaleziono zgłoszenia.' });
+  const quantity = req.body.quantity ? Math.round(Number(req.body.quantity)) : existing.quantity;
+  await dbRun(
+    `UPDATE purchase_requests SET name=$1, quantity=$2, description=$3, status=$4 WHERE id=$5`,
+    [req.body.name ? req.body.name.trim() : existing.name, quantity, req.body.description ?? existing.description,
+     req.body.status || existing.status, req.params.id]
+  );
+  const row = await dbGet(`SELECT * FROM purchase_requests WHERE id = $1`, [req.params.id]);
+  await logAudit(req.user.unitId, req.user.name, 'Zmieniono zapotrzebowanie', `${row.name} → ${row.status}`);
+  res.json(row);
+});
+
+app.delete('/api/purchases/:id', requireAuth, purchasePerm, async (req, res) => {
+  const row = await dbGet(`DELETE FROM purchase_requests WHERE id = $1 AND unit_id = $2 RETURNING id`, [req.params.id, req.user.unitId]);
+  if (!row) return res.status(404).json({ error: 'Nie znaleziono zgłoszenia.' });
+  await logAudit(req.user.unitId, req.user.name, 'Usunięto zapotrzebowanie', '');
+  res.status(204).end();
+});
+
 // ---------- USTAWIENIA JEDNOSTKI ----------
 // Kod gminy — dowolny, wspólny ciąg znaków, który Zarząd ustala samodzielnie.
 // Jednostki z tym samym kodem grupują się razem w panelu gminy (patrz niżej).
@@ -706,7 +764,7 @@ app.get('/api/gmina/overview', requireGminaAuth, async (req, res) => {
 // roli bazowej — każda flaga daje pełny (odczyt+zapis) dostęp do jednego
 // modułu. Konta i Historia są celowo NIE do nadania — to zawsze wyłącznie
 // Zarząd, bo dotyczą zarządzania innymi kontami i pełnego dziennika zdarzeń.
-const GRANTABLE_PERMISSIONS = ['firefighters', 'fleet', 'gear', 'trips', 'schedule', 'dues', 'mdp', 'structure', 'exercises', 'announcements'];
+const GRANTABLE_PERMISSIONS = ['firefighters', 'fleet', 'gear', 'trips', 'schedule', 'dues', 'mdp', 'structure', 'exercises', 'announcements', 'purchases'];
 
 app.get('/api/users', requireAuth, requireRole('Zarząd'), async (req, res) => {
   const rows = await dbAll(`SELECT id, name, email, role, permissions FROM users WHERE unit_id = $1`, [req.user.unitId]);
@@ -802,7 +860,7 @@ app.get('/api/backup/full', requireAuth, requireRole('Zarząd'), async (req, res
   const tables = {
     firefighters: 'firefighters', vehicles: 'vehicles', fuel: 'fuel_log', gear: 'gear',
     trips: 'trips', schedule: 'schedule', dues: 'dues', mdpMembers: 'mdp_members',
-    mdpMeetings: 'mdp_meetings', tasks: 'tasks', announcements: 'announcements', sections: 'sections', exercises: 'exercises', tripVehicles: 'trip_vehicles',
+    mdpMeetings: 'mdp_meetings', tasks: 'tasks', announcements: 'announcements', sections: 'sections', exercises: 'exercises', tripVehicles: 'trip_vehicles', purchases: 'purchase_requests',
   };
   const data = {};
   for (const [key, table] of Object.entries(tables)) {
