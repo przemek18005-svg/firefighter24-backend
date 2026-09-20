@@ -91,7 +91,41 @@ async function initSchema() {
       place TEXT,
       crew TEXT,
       lat REAL,
-      lng REAL
+      lng REAL,
+      departure_time TEXT,
+      return_time TEXT,
+      street TEXT,
+      house_number TEXT,
+      postal_code TEXT,
+      city TEXT,
+      address_gmina TEXT,
+      description TEXT,
+      other_services JSONB NOT NULL DEFAULT '[]'::jsonb,
+      medical_aid BOOLEAN NOT NULL DEFAULT false,
+      injured BOOLEAN NOT NULL DEFAULT false,
+      handover_notes TEXT,
+      psp_report_number TEXT,
+      equipment_used JSONB NOT NULL DEFAULT '[]'::jsonb,
+      supplies_used JSONB NOT NULL DEFAULT '[]'::jsonb,
+      present_not_departed_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+      attachment_filename TEXT,
+      attachment_mimetype TEXT,
+      attachment_data TEXT
+    );
+
+    -- Jeden wyjazd może mieć wiele pojazdów, każdy z własną załogą
+    -- (dowódca, kierowca, ratownicy) — stąd osobna tabela zamiast pól w trips.
+    CREATE TABLE IF NOT EXISTS trip_vehicles (
+      id TEXT PRIMARY KEY,
+      unit_id TEXT NOT NULL REFERENCES units(id) ON DELETE CASCADE,
+      trip_id TEXT NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+      vehicle_id TEXT REFERENCES vehicles(id) ON DELETE SET NULL,
+      vehicle_name TEXT,
+      mileage_after REAL,
+      engine_hours REAL,
+      commander_id TEXT REFERENCES firefighters(id) ON DELETE SET NULL,
+      driver_id TEXT REFERENCES firefighters(id) ON DELETE SET NULL,
+      rescuer_ids JSONB NOT NULL DEFAULT '[]'::jsonb
     );
 
     CREATE TABLE IF NOT EXISTS schedule (
@@ -239,6 +273,27 @@ async function initSchema() {
     ALTER TABLE units ADD COLUMN IF NOT EXISTS gmina_code TEXT;
     CREATE INDEX IF NOT EXISTS idx_units_gmina_code ON units(gmina_code);
     ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions JSONB NOT NULL DEFAULT '{}'::jsonb;
+    ALTER TABLE trips ADD COLUMN IF NOT EXISTS departure_time TEXT;
+    ALTER TABLE trips ADD COLUMN IF NOT EXISTS return_time TEXT;
+    ALTER TABLE trips ADD COLUMN IF NOT EXISTS street TEXT;
+    ALTER TABLE trips ADD COLUMN IF NOT EXISTS house_number TEXT;
+    ALTER TABLE trips ADD COLUMN IF NOT EXISTS postal_code TEXT;
+    ALTER TABLE trips ADD COLUMN IF NOT EXISTS city TEXT;
+    ALTER TABLE trips ADD COLUMN IF NOT EXISTS address_gmina TEXT;
+    ALTER TABLE trips ADD COLUMN IF NOT EXISTS description TEXT;
+    ALTER TABLE trips ADD COLUMN IF NOT EXISTS other_services JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ALTER TABLE trips ADD COLUMN IF NOT EXISTS medical_aid BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE trips ADD COLUMN IF NOT EXISTS injured BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE trips ADD COLUMN IF NOT EXISTS handover_notes TEXT;
+    ALTER TABLE trips ADD COLUMN IF NOT EXISTS psp_report_number TEXT;
+    ALTER TABLE trips ADD COLUMN IF NOT EXISTS equipment_used JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ALTER TABLE trips ADD COLUMN IF NOT EXISTS supplies_used JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ALTER TABLE trips ADD COLUMN IF NOT EXISTS present_not_departed_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ALTER TABLE trips ADD COLUMN IF NOT EXISTS attachment_filename TEXT;
+    ALTER TABLE trips ADD COLUMN IF NOT EXISTS attachment_mimetype TEXT;
+    ALTER TABLE trips ADD COLUMN IF NOT EXISTS attachment_data TEXT;
+    CREATE INDEX IF NOT EXISTS idx_trip_vehicles_unit ON trip_vehicles(unit_id);
+    CREATE INDEX IF NOT EXISTS idx_trip_vehicles_trip ON trip_vehicles(trip_id);
   `);
 }
 

@@ -16,7 +16,10 @@ const { sendEmail, EMAIL_CONFIGURED, EMAIL_MODE } = require('./email');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+// Limit domyślny (100kb) jest za mały na załączniki zdjęć do raportów z
+// wyjazdów (zapisywane tymczasowo jako base64 wprost w bazie — patrz niżej
+// przy trasie /api/trips, sekcja o załączniku). 8mb z zapasem na kodowanie base64.
+app.use(express.json({ limit: '8mb' }));
 app.set('trust proxy', 1); // hostingi typu Koyeb/Railway stoją za reverse proxy — potrzebne, żeby rate-limit widział prawdziwe IP
 
 const PORT = process.env.PORT || 3001;
@@ -366,14 +369,150 @@ app.use('/api/gear', crudRoutes({
   },
 }));
 
-app.use('/api/trips', crudRoutes({
-  table: 'trips', fields: ['date', 'type', 'place', 'crew', 'lat', 'lng'],
-  readRoles: ['Zarząd'], writeRoles: ['Zarząd'], permissionFlag: 'trips', auditLabel: 'wyjazd',
-  rules: {
-    date: { required: true, type: 'date' },
-    place: { type: 'string', max: 200 },
-  },
-}));
+// Wyjazdy — osobne, ręcznie pisane trasy (nie generyczny crudRoutes), z dwóch
+// powodów: (1) lista wyjazdów NIE dociąga za każdym razem załącznika zdjęcia
+// (może być ciężki) — do tego jest osobna trasa /:id/attachment; (2) pola
+// logiczne i listy JSON mają w bazie NOT NULL — trzeba pilnować, żeby nigdy
+// nie wysłać do nich jawnego null, tylko sensowną wartość domyślną.
+const TRIP_FIELDS = ['date', 'type', 'place', 'crew', 'lat', 'lng', 'departure_time', 'return_time',
+  'street', 'house_number', 'postal_code', 'city', 'address_gmina', 'description',
+  'other_services', 'medical_aid', 'injured', 'handover_notes', 'psp_report_number',
+  'equipment_used', 'supplies_used', 'present_not_departed_ids',
+  'attachment_filename', 'attachment_mimetype', 'attachment_data'];
+const TRIP_LIST_FIELDS = TRIP_FIELDS.filter(f => f !== 'attachment_data');
+const TRIP_JSONB_ARRAY_FIELDS = ['other_services', 'equipment_used', 'supplies_used', 'present_not_departed_ids'];
+// Front-end wysyła te cztery pola jako gotowy tekst JSON (JSON.stringify po
+// swojej stronie) — tu tylko przekazujemy dalej, Postgres sam rzutuje tekst
+// JSON na kolumnę jsonb. Booleany dostają jawną wartość true/false, nigdy null.
+function tripFieldValue(body, f) {
+  if (f === 'medical_aid' || f === 'injured') return body[f] === true;
+  if (TRIP_JSONB_ARRAY_FIELDS.includes(f)) return body[f] ?? '[]';
+  return body[f] ?? null;
+}
+const tripValidator = validateBody({
+  date: { required: true, type: 'date' },
+  place: { type: 'string', max: 200 },
+  departure_time: { type: 'string', max: 10 },
+  return_time: { type: 'string', max: 10 },
+  street: { type: 'string', max: 150 },
+  house_number: { type: 'string', max: 30 },
+  postal_code: { type: 'string', max: 10 },
+  city: { type: 'string', max: 100 },
+  address_gmina: { type: 'string', max: 100 },
+  description: { type: 'string', max: 3000 },
+  other_services: { type: 'string', max: 2000 },
+  handover_notes: { type: 'string', max: 3000 },
+  psp_report_number: { type: 'string', max: 50 },
+  equipment_used: { type: 'string', max: 3000 },
+  supplies_used: { type: 'string', max: 3000 },
+  present_not_departed_ids: { type: 'string', max: 3000 },
+  attachment_filename: { type: 'string', max: 255 },
+  attachment_mimetype: { type: 'string', max: 100 },
+  attachment_data: { type: 'string', max: 7000000 },
+});
+const tripPerm = requireRoleOrPermission(['Zarząd'], 'trips');
+
+app.get('/api/trips', requireAuth, tripPerm, async (req, res) => {
+  const rows = await dbAll(`SELECT id, unit_id, ${TRIP_LIST_FIELDS.join(', ')} FROM trips WHERE unit_id = $1`, [req.user.unitId]);
+  res.json(rows);
+});
+
+// Załącznik pobierany osobno, tylko na żądanie — nie obciąża listy wyjazdów.
+app.get('/api/trips/:id/attachment', requireAuth, tripPerm, async (req, res) => {
+  const row = await dbGet(`SELECT attachment_filename, attachment_mimetype, attachment_data FROM trips WHERE id = $1 AND unit_id = $2`, [req.params.id, req.user.unitId]);
+  if (!row || !row.attachment_data) return res.status(404).json({ error: 'Brak załącznika.' });
+  res.json(row);
+});
+
+app.post('/api/trips', requireAuth, tripPerm, tripValidator, async (req, res) => {
+  try {
+    const id = uuid();
+    const cols = ['id', 'unit_id', ...TRIP_FIELDS];
+    const values = [id, req.user.unitId, ...TRIP_FIELDS.map(f => tripFieldValue(req.body, f))];
+    const placeholders = cols.map((_, i) => `$${i + 1}`).join(',');
+    const row = await dbGet(
+      `INSERT INTO trips (${cols.join(',')}) VALUES (${placeholders}) RETURNING id, unit_id, ${TRIP_LIST_FIELDS.join(', ')}`,
+      values
+    );
+    await logAudit(req.user.unitId, req.user.name, 'Dodano: wyjazd', '');
+    res.status(201).json(row);
+  } catch (e) { console.error(e.message); res.status(500).json({ error: 'Błąd zapisu danych.' }); }
+});
+
+app.put('/api/trips/:id', requireAuth, tripPerm, tripValidator, async (req, res) => {
+  try {
+    const values = TRIP_FIELDS.map(f => tripFieldValue(req.body, f));
+    const setClause = TRIP_FIELDS.map((f, i) => `${f} = $${i + 1}`).join(', ');
+    const row = await dbGet(
+      `UPDATE trips SET ${setClause} WHERE id = $${TRIP_FIELDS.length + 1} AND unit_id = $${TRIP_FIELDS.length + 2} RETURNING id, unit_id, ${TRIP_LIST_FIELDS.join(', ')}`,
+      [...values, req.params.id, req.user.unitId]
+    );
+    if (!row) return res.status(404).json({ error: 'Nie znaleziono rekordu.' });
+    await logAudit(req.user.unitId, req.user.name, 'Edytowano: wyjazd', '');
+    res.json(row);
+  } catch (e) { console.error(e.message); res.status(500).json({ error: 'Błąd zapisu danych.' }); }
+});
+
+app.delete('/api/trips/:id', requireAuth, tripPerm, async (req, res) => {
+  const row = await dbGet(`DELETE FROM trips WHERE id = $1 AND unit_id = $2 RETURNING id`, [req.params.id, req.user.unitId]);
+  if (!row) return res.status(404).json({ error: 'Nie znaleziono rekordu.' });
+  await logAudit(req.user.unitId, req.user.name, 'Usunięto: wyjazd', '');
+  res.status(204).end();
+});
+
+// Pojazdy przypisane do konkretnego wyjazdu (jeden wyjazd = wiele pojazdów,
+// każdy z własną załogą). Zwracamy od razu imiona dowódcy/kierowcy przez JOIN
+// — ratowników (lista ID) front-end dopasowuje sam do już wczytanej listy strażaków.
+app.get('/api/trip-vehicles', requireAuth, tripPerm, async (req, res) => {
+  const rows = await dbAll(`
+    SELECT tv.*, cf.first AS commander_first, cf.last AS commander_last,
+           df.first AS driver_first, df.last AS driver_last
+    FROM trip_vehicles tv
+    LEFT JOIN firefighters cf ON cf.id = tv.commander_id
+    LEFT JOIN firefighters df ON df.id = tv.driver_id
+    WHERE tv.unit_id = $1
+  `, [req.user.unitId]);
+  res.json(rows);
+});
+
+app.post('/api/trip-vehicles', requireAuth, tripPerm, validateBody({
+  trip_id: { required: true, type: 'string', max: 100 },
+  vehicle_name: { type: 'string', max: 150 },
+  mileage_after: { type: 'nonNegativeNumber' },
+  engine_hours: { type: 'nonNegativeNumber' },
+}), async (req, res) => {
+  const trip = await dbGet(`SELECT id FROM trips WHERE id = $1 AND unit_id = $2`, [req.body.trip_id, req.user.unitId]);
+  if (!trip) return res.status(404).json({ error: 'Nie znaleziono wyjazdu.' });
+  const id = uuid();
+  await dbRun(
+    `INSERT INTO trip_vehicles (id, unit_id, trip_id, vehicle_id, vehicle_name, mileage_after, engine_hours, commander_id, driver_id, rescuer_ids)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+    [id, req.user.unitId, req.body.trip_id, req.body.vehicle_id || null, req.body.vehicle_name || null,
+     req.body.mileage_after ?? null, req.body.engine_hours ?? null, req.body.commander_id || null, req.body.driver_id || null,
+     req.body.rescuer_ids ?? '[]']
+  );
+  const row = await dbGet(`SELECT * FROM trip_vehicles WHERE id = $1`, [id]);
+  await logAudit(req.user.unitId, req.user.name, 'Dodano pojazd do wyjazdu', row.vehicle_name || '');
+  res.status(201).json(row);
+});
+
+app.put('/api/trip-vehicles/:id', requireAuth, tripPerm, async (req, res) => {
+  const existing = await dbGet(`SELECT id FROM trip_vehicles WHERE id = $1 AND unit_id = $2`, [req.params.id, req.user.unitId]);
+  if (!existing) return res.status(404).json({ error: 'Nie znaleziono rekordu.' });
+  await dbRun(
+    `UPDATE trip_vehicles SET vehicle_id=$1, vehicle_name=$2, mileage_after=$3, engine_hours=$4, commander_id=$5, driver_id=$6, rescuer_ids=$7 WHERE id=$8`,
+    [req.body.vehicle_id || null, req.body.vehicle_name || null, req.body.mileage_after ?? null, req.body.engine_hours ?? null,
+     req.body.commander_id || null, req.body.driver_id || null, req.body.rescuer_ids ?? '[]', req.params.id]
+  );
+  const row = await dbGet(`SELECT * FROM trip_vehicles WHERE id = $1`, [req.params.id]);
+  res.json(row);
+});
+
+app.delete('/api/trip-vehicles/:id', requireAuth, tripPerm, async (req, res) => {
+  const row = await dbGet(`DELETE FROM trip_vehicles WHERE id = $1 AND unit_id = $2 RETURNING id`, [req.params.id, req.user.unitId]);
+  if (!row) return res.status(404).json({ error: 'Nie znaleziono rekordu.' });
+  res.status(204).end();
+});
 
 app.use('/api/schedule', crudRoutes({
   table: 'schedule', fields: ['type', 'date', 'description'],
@@ -663,7 +802,7 @@ app.get('/api/backup/full', requireAuth, requireRole('Zarząd'), async (req, res
   const tables = {
     firefighters: 'firefighters', vehicles: 'vehicles', fuel: 'fuel_log', gear: 'gear',
     trips: 'trips', schedule: 'schedule', dues: 'dues', mdpMembers: 'mdp_members',
-    mdpMeetings: 'mdp_meetings', tasks: 'tasks', announcements: 'announcements', sections: 'sections', exercises: 'exercises',
+    mdpMeetings: 'mdp_meetings', tasks: 'tasks', announcements: 'announcements', sections: 'sections', exercises: 'exercises', tripVehicles: 'trip_vehicles',
   };
   const data = {};
   for (const [key, table] of Object.entries(tables)) {
