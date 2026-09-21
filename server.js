@@ -819,6 +819,115 @@ app.get('/api/gmina/trips', requireGminaAuth, async (req, res) => {
   res.json({ trips, settings });
 });
 
+// Terminy ważności: pojazdy (OC, przegląd techniczny) i sprzęt/ubrania —
+// pokazujemy szczegółowo, bo to nie są dane osobowe. Badania lekarskie
+// strażaków — TYLKO jako liczby na jednostkę (nigdy imiona/nazwiska), żeby
+// nie złamać zasady "gmina nie widzi danych osobowych" przyjętej dla tego
+// panelu. Zwracamy WSZYSTKIE wpisy (nie tylko "wkrótce wygasające") — front-end
+// sam podświetla pilne terminy; gmina i tak powinna widzieć pełny obraz.
+app.get('/api/gmina/compliance', requireGminaAuth, async (req, res) => {
+  const units = await dbAll(`SELECT id, name FROM units WHERE gmina_code = $1 ORDER BY name`, [req.gmina.gminaCode]);
+  if (!units.length) return res.json({ vehicles: [], gear: [], medicalByUnit: [] });
+  const unitIds = units.map(u => u.id);
+  const unitNameById = Object.fromEntries(units.map(u => [u.id, u.name]));
+
+  const vehicleRows = await dbAll(
+    `SELECT unit_id, name, plate, oc_date, review_date FROM vehicles WHERE unit_id = ANY($1) ORDER BY oc_date NULLS LAST`,
+    [unitIds]
+  );
+  const vehicles = vehicleRows.map(v => ({
+    unitName: unitNameById[v.unit_id], name: v.name, plate: v.plate,
+    ocDate: v.oc_date, reviewDate: v.review_date,
+  }));
+
+  const gearRows = await dbAll(
+    `SELECT unit_id, name, category, review_date FROM gear WHERE unit_id = ANY($1) AND review_date IS NOT NULL ORDER BY review_date`,
+    [unitIds]
+  );
+  const gear = gearRows.map(g => ({
+    unitName: unitNameById[g.unit_id], name: g.name, category: g.category, reviewDate: g.review_date,
+  }));
+
+  const medicalByUnit = await Promise.all(units.map(async (unit) => {
+    const [total, expiring30, overdue] = await Promise.all([
+      dbGet(`SELECT COUNT(*)::int AS n FROM firefighters WHERE unit_id = $1 AND med_date IS NOT NULL`, [unit.id]),
+      dbGet(`SELECT COUNT(*)::int AS n FROM firefighters WHERE unit_id = $1 AND med_date IS NOT NULL AND med_date::date BETWEEN NOW()::date AND (NOW() + INTERVAL '30 days')::date`, [unit.id]),
+      dbGet(`SELECT COUNT(*)::int AS n FROM firefighters WHERE unit_id = $1 AND med_date IS NOT NULL AND med_date::date < NOW()::date`, [unit.id]),
+    ]);
+    return { unitName: unit.name, withMedicalDate: total.n, expiring30: expiring30.n, overdue: overdue.n };
+  }));
+
+  res.json({ vehicles, gear, medicalByUnit });
+});
+
+// Ekwiwalent PER STRAŻAK — na wyraźną prośbę: gmina często wypłaca
+// ekwiwalent bezpośrednio poszczególnym strażakom, więc musi wiedzieć KTO
+// brał udział w danym wyjeździe, nie tylko ile to trwało. Dane pochodzą
+// wyłącznie z przypisanej załogi pojazdu (dowódca/kierowca/ratownicy) —
+// wyjazdy bez takiego przypisania NIE mają tu identyfikowalnych uczestników
+// (liczymy je osobno jako "tripsWithoutCrew", żeby było widać lukę).
+app.get('/api/gmina/trip-crew', requireGminaAuth, async (req, res) => {
+  const units = await dbAll(`SELECT id, name FROM units WHERE gmina_code = $1`, [req.gmina.gminaCode]);
+  if (!units.length) return res.json({ participations: [], tripsWithoutCrew: 0, tripsTotal: 0 });
+  const unitIds = units.map(u => u.id);
+  const unitNameById = Object.fromEntries(units.map(u => [u.id, u.name]));
+
+  const sixMonthsAgo = new Date();
+  sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+  const cutoff = sixMonthsAgo.toISOString().slice(0, 10);
+
+  const trips = await dbAll(
+    `SELECT id, unit_id, date, type, departure_time, return_time FROM trips WHERE unit_id = ANY($1) AND date >= $2`,
+    [unitIds, cutoff]
+  );
+  if (!trips.length) return res.json({ participations: [], tripsWithoutCrew: 0, tripsTotal: 0 });
+  const tripById = Object.fromEntries(trips.map(t => [t.id, t]));
+  const tripIds = trips.map(t => t.id);
+
+  const firefighters = await dbAll(`SELECT id, unit_id, first, last FROM firefighters WHERE unit_id = ANY($1)`, [unitIds]);
+  const ffById = Object.fromEntries(firefighters.map(f => [f.id, f]));
+
+  const tripVehicles = await dbAll(
+    `SELECT trip_id, commander_id, driver_id, rescuer_ids FROM trip_vehicles WHERE trip_id = ANY($1)`,
+    [tripIds]
+  );
+  const tripsWithCrew = new Set(tripVehicles.map(tv => tv.trip_id));
+
+  const participationByFirefighter = {};
+  for (const tv of tripVehicles) {
+    const trip = tripById[tv.trip_id];
+    if (!trip) continue;
+    const durationHours = tripDurationHours(trip.departure_time, trip.return_time);
+    const roleByFirefighter = {};
+    if (tv.commander_id) roleByFirefighter[tv.commander_id] = 'Dowódca';
+    if (tv.driver_id) roleByFirefighter[tv.driver_id] = roleByFirefighter[tv.driver_id] ? roleByFirefighter[tv.driver_id] + ' / Kierowca' : 'Kierowca';
+    (tv.rescuer_ids || []).forEach(rid => { if (!roleByFirefighter[rid]) roleByFirefighter[rid] = 'Ratownik'; });
+
+    Object.keys(roleByFirefighter).forEach(fid => {
+      const ff = ffById[fid];
+      if (!ff) return; // strażak móg zostać usunięty od tego czasu
+      if (!participationByFirefighter[fid]) {
+        participationByFirefighter[fid] = {
+          firefighterId: fid, first: ff.first, last: ff.last, unitName: unitNameById[ff.unit_id], trips: [],
+        };
+      }
+      // ta sama osoba może być przypisana do kilku pojazdów w tym samym wyjeździe
+      // (np. dowódca jednego wozu i ratownik drugiego) — liczymy wyjazd raz.
+      if (!participationByFirefighter[fid].trips.find(t => t.tripId === trip.id)) {
+        participationByFirefighter[fid].trips.push({
+          tripId: trip.id, date: trip.date, type: trip.type, durationHours, role: roleByFirefighter[fid],
+        });
+      }
+    });
+  }
+
+  res.json({
+    participations: Object.values(participationByFirefighter),
+    tripsWithoutCrew: trips.length - tripsWithCrew.size,
+    tripsTotal: trips.length,
+  });
+});
+
 // ---------- KONTA UŻYTKOWNIKÓW ----------
 // Uprawnienia, które Zarząd może nadać pojedynczej osobie niezależnie od jej
 // roli bazowej — każda flaga daje pełny (odczyt+zapis) dostęp do jednego
