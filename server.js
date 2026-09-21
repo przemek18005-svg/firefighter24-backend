@@ -872,8 +872,12 @@ app.get('/api/gmina/compliance', requireGminaAuth, async (req, res) => {
     const medicalByUnit = await Promise.all(units.map(async (unit) => {
       const [total, expiring30, overdue] = await Promise.all([
         dbGet(`SELECT COUNT(*)::int AS n FROM firefighters WHERE unit_id = $1 AND med_date IS NOT NULL`, [unit.id]),
-        dbGet(`SELECT COUNT(*)::int AS n FROM firefighters WHERE unit_id = $1 AND med_date IS NOT NULL AND med_date::date BETWEEN NOW()::date AND (NOW() + INTERVAL '30 days')::date`, [unit.id]),
-        dbGet(`SELECT COUNT(*)::int AS n FROM firefighters WHERE unit_id = $1 AND med_date IS NOT NULL AND med_date::date < NOW()::date`, [unit.id]),
+        // Warunek "med_date ~ ..." to obrona przed danymi, gdzie ktoś zapisał puste
+        // pole daty jako pusty tekst "" zamiast NULL — rzutowanie ""::date wywala
+        // całe zapytanie (invalid input syntax for type date). Odtworzyłem to 1:1
+        // na testowych danych po tym, jak zgłosiłeś błąd — realny przypadek, nie teoria.
+        dbGet(`SELECT COUNT(*)::int AS n FROM firefighters WHERE unit_id = $1 AND med_date ~ '^\\d{4}-\\d{2}-\\d{2}' AND med_date::date BETWEEN NOW()::date AND (NOW() + INTERVAL '30 days')::date`, [unit.id]),
+        dbGet(`SELECT COUNT(*)::int AS n FROM firefighters WHERE unit_id = $1 AND med_date ~ '^\\d{4}-\\d{2}-\\d{2}' AND med_date::date < NOW()::date`, [unit.id]),
       ]);
       return { unitName: unit.name, withMedicalDate: total.n, expiring30: expiring30.n, overdue: overdue.n };
     }));
