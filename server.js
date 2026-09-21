@@ -759,6 +759,66 @@ app.get('/api/gmina/overview', requireGminaAuth, async (req, res) => {
   res.json({ gminaCode: req.gmina.gminaCode, units: overview });
 });
 
+// Czas trwania wyjazdu w godzinach (liczba dziesiętna), z obsługą przypadku
+// gdy powrót jest po północy (np. wyjazd 23:40 -> powrót 00:20). Zwraca null,
+// gdy brakuje którejś z godzin — takiego wyjazdu nie da się policzyć.
+function tripDurationHours(departureTime, returnTime) {
+  if (!departureTime || !returnTime) return null;
+  const dm = /^(\d{1,2}):(\d{2})$/.exec(departureTime);
+  const rm = /^(\d{1,2}):(\d{2})$/.exec(returnTime);
+  if (!dm || !rm) return null;
+  let startMin = Number(dm[1]) * 60 + Number(dm[2]);
+  let endMin = Number(rm[1]) * 60 + Number(rm[2]);
+  if (endMin < startMin) endMin += 24 * 60; // powrót po północy
+  return (endMin - startMin) / 60;
+}
+
+app.get('/api/gmina/settings', requireGminaAuth, async (req, res) => {
+  const row = await dbGet(`SELECT rate_per_hour, rounding_method FROM gmina_settings WHERE gmina_code = $1`, [req.gmina.gminaCode]);
+  res.json(row || { rate_per_hour: 0, rounding_method: 'ceil_per_trip' });
+});
+
+app.put('/api/gmina/settings', requireGminaAuth, validateBody({
+  rate_per_hour: { type: 'nonNegativeNumber' },
+  rounding_method: { type: 'enum', enum: ['ceil_per_trip', 'sum_exact'] },
+}), async (req, res) => {
+  const rate = req.body.rate_per_hour ?? 0;
+  const method = req.body.rounding_method || 'ceil_per_trip';
+  await dbRun(`
+    INSERT INTO gmina_settings (gmina_code, rate_per_hour, rounding_method, updated_at)
+    VALUES ($1,$2,$3,NOW())
+    ON CONFLICT (gmina_code) DO UPDATE SET rate_per_hour = $2, rounding_method = $3, updated_at = NOW()
+  `, [req.gmina.gminaCode, rate, method]);
+  res.json({ rate_per_hour: rate, rounding_method: method });
+});
+
+// Lista wyjazdów jednostek tej gminy z ostatnich 6 miesięcy, z policzonym
+// czasem trwania każdego — do wyliczenia ekwiwalentu. Celowo BEZ adresu,
+// opisu, załogi czy innych szczegółów operacyjnych — tylko to, co potrzebne
+// do rozliczenia czasu (data, rodzaj, godziny, czas trwania).
+app.get('/api/gmina/trips', requireGminaAuth, async (req, res) => {
+  const units = await dbAll(`SELECT id, name FROM units WHERE gmina_code = $1 ORDER BY name`, [req.gmina.gminaCode]);
+  const settings = (await dbGet(`SELECT rate_per_hour, rounding_method FROM gmina_settings WHERE gmina_code = $1`, [req.gmina.gminaCode]))
+    || { rate_per_hour: 0, rounding_method: 'ceil_per_trip' };
+  if (!units.length) return res.json({ trips: [], settings });
+  const unitIds = units.map(u => u.id);
+  const unitNameById = Object.fromEntries(units.map(u => [u.id, u.name]));
+  const sixMonthsAgo = new Date();
+  sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+  const cutoff = sixMonthsAgo.toISOString().slice(0, 10);
+  const rows = await dbAll(
+    `SELECT id, unit_id, date, type, departure_time, return_time FROM trips
+     WHERE unit_id = ANY($1) AND date >= $2 ORDER BY date DESC`,
+    [unitIds, cutoff]
+  );
+  const trips = rows.map(t => ({
+    id: t.id, unitName: unitNameById[t.unit_id], date: t.date, type: t.type,
+    departureTime: t.departure_time, returnTime: t.return_time,
+    durationHours: tripDurationHours(t.departure_time, t.return_time),
+  }));
+  res.json({ trips, settings });
+});
+
 // ---------- KONTA UŻYTKOWNIKÓW ----------
 // Uprawnienia, które Zarząd może nadać pojedynczej osobie niezależnie od jej
 // roli bazowej — każda flaga daje pełny (odczyt+zapis) dostęp do jednego

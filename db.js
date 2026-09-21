@@ -249,6 +249,17 @@ async function initSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
+    -- Stawka za godzinę akcji i sposób zaokrąglania czasu — ustala gmina,
+    -- osobno dla każdego kodu gminy (nie dla pojedynczego konta, bo kilka
+    -- kont gminnych może współdzielić ten sam kod i muszą widzieć te same
+    -- ustawienia).
+    CREATE TABLE IF NOT EXISTS gmina_settings (
+      gmina_code TEXT PRIMARY KEY,
+      rate_per_hour NUMERIC(10,2) NOT NULL DEFAULT 0,
+      rounding_method TEXT NOT NULL DEFAULT 'ceil_per_trip' CHECK(rounding_method IN ('ceil_per_trip','sum_exact')),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
     CREATE INDEX IF NOT EXISTS idx_firefighters_unit ON firefighters(unit_id);
     CREATE INDEX IF NOT EXISTS idx_vehicles_unit ON vehicles(unit_id);
     CREATE INDEX IF NOT EXISTS idx_gear_unit ON gear(unit_id);
