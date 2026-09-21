@@ -24,6 +24,20 @@ app.set('trust proxy', 1); // hostingi typu Koyeb/Railway stoją za reverse prox
 
 const PORT = process.env.PORT || 3001;
 
+// SIATKA BEZPIECZEŃSTWA: w nowszych wersjach Node.js nieobsłużone odrzucenie
+// obietnicy (np. zapomniany try/catch przy zapytaniu do bazy) domyślnie
+// UBIJA CAŁY PROCES, zamiast tylko tego jednego żądania — co objawia się jako
+// błąd 502 dla WSZYSTKICH użytkowników naraz, dopóki Render nie zrestartuje
+// serwera. To właśnie się stało 21.09 z trasami gminy. Ten handler nie
+// naprawia przyczyny (każda trasa i tak powinna mieć własny try/catch —
+// patrz niżej), ale jest ostatnią linią obrony, gdyby gdzieś to pominięto.
+process.on('unhandledRejection', (reason) => {
+  console.error('NIEOBSŁUŻONE ODRZUCENIE OBIETNICY (serwer NIE zostanie ubity dzięki temu handlerowi):', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('NIEZŁAPANY WYJĄTEK (serwer NIE zostanie ubity dzięki temu handlerowi):', err);
+});
+
 /* ---------- Małe pomocniki do zapytań (żeby nie powtarzać pool.query wszędzie) ---------- */
 async function dbGet(sql, params = []) {
   const { rows } = await pool.query(sql, params);
@@ -774,22 +788,26 @@ function tripDurationHours(departureTime, returnTime) {
 }
 
 app.get('/api/gmina/settings', requireGminaAuth, async (req, res) => {
-  const row = await dbGet(`SELECT rate_per_hour, rounding_method FROM gmina_settings WHERE gmina_code = $1`, [req.gmina.gminaCode]);
-  res.json(row || { rate_per_hour: 0, rounding_method: 'ceil_per_trip' });
+  try {
+    const row = await dbGet(`SELECT rate_per_hour, rounding_method FROM gmina_settings WHERE gmina_code = $1`, [req.gmina.gminaCode]);
+    res.json(row || { rate_per_hour: 0, rounding_method: 'ceil_per_trip' });
+  } catch (e) { console.error('Błąd /api/gmina/settings (GET):', e.message); res.status(500).json({ error: 'Błąd odczytu ustawień.' }); }
 });
 
 app.put('/api/gmina/settings', requireGminaAuth, validateBody({
   rate_per_hour: { type: 'nonNegativeNumber' },
   rounding_method: { type: 'enum', enum: ['ceil_per_trip', 'sum_exact'] },
 }), async (req, res) => {
-  const rate = req.body.rate_per_hour ?? 0;
-  const method = req.body.rounding_method || 'ceil_per_trip';
-  await dbRun(`
-    INSERT INTO gmina_settings (gmina_code, rate_per_hour, rounding_method, updated_at)
-    VALUES ($1,$2,$3,NOW())
-    ON CONFLICT (gmina_code) DO UPDATE SET rate_per_hour = $2, rounding_method = $3, updated_at = NOW()
-  `, [req.gmina.gminaCode, rate, method]);
-  res.json({ rate_per_hour: rate, rounding_method: method });
+  try {
+    const rate = req.body.rate_per_hour ?? 0;
+    const method = req.body.rounding_method || 'ceil_per_trip';
+    await dbRun(`
+      INSERT INTO gmina_settings (gmina_code, rate_per_hour, rounding_method, updated_at)
+      VALUES ($1,$2,$3,NOW())
+      ON CONFLICT (gmina_code) DO UPDATE SET rate_per_hour = $2, rounding_method = $3, updated_at = NOW()
+    `, [req.gmina.gminaCode, rate, method]);
+    res.json({ rate_per_hour: rate, rounding_method: method });
+  } catch (e) { console.error('Błąd /api/gmina/settings (PUT):', e.message); res.status(500).json({ error: 'Błąd zapisu ustawień.' }); }
 });
 
 // Lista wyjazdów jednostek tej gminy z ostatnich 6 miesięcy, z policzonym
@@ -797,26 +815,28 @@ app.put('/api/gmina/settings', requireGminaAuth, validateBody({
 // opisu, załogi czy innych szczegółów operacyjnych — tylko to, co potrzebne
 // do rozliczenia czasu (data, rodzaj, godziny, czas trwania).
 app.get('/api/gmina/trips', requireGminaAuth, async (req, res) => {
-  const units = await dbAll(`SELECT id, name FROM units WHERE gmina_code = $1 ORDER BY name`, [req.gmina.gminaCode]);
-  const settings = (await dbGet(`SELECT rate_per_hour, rounding_method FROM gmina_settings WHERE gmina_code = $1`, [req.gmina.gminaCode]))
-    || { rate_per_hour: 0, rounding_method: 'ceil_per_trip' };
-  if (!units.length) return res.json({ trips: [], settings });
-  const unitIds = units.map(u => u.id);
-  const unitNameById = Object.fromEntries(units.map(u => [u.id, u.name]));
-  const sixMonthsAgo = new Date();
-  sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
-  const cutoff = sixMonthsAgo.toISOString().slice(0, 10);
-  const rows = await dbAll(
-    `SELECT id, unit_id, date, type, departure_time, return_time FROM trips
-     WHERE unit_id = ANY($1) AND date >= $2 ORDER BY date DESC`,
-    [unitIds, cutoff]
-  );
-  const trips = rows.map(t => ({
-    id: t.id, unitName: unitNameById[t.unit_id], date: t.date, type: t.type,
-    departureTime: t.departure_time, returnTime: t.return_time,
-    durationHours: tripDurationHours(t.departure_time, t.return_time),
-  }));
-  res.json({ trips, settings });
+  try {
+    const units = await dbAll(`SELECT id, name FROM units WHERE gmina_code = $1 ORDER BY name`, [req.gmina.gminaCode]);
+    const settings = (await dbGet(`SELECT rate_per_hour, rounding_method FROM gmina_settings WHERE gmina_code = $1`, [req.gmina.gminaCode]))
+      || { rate_per_hour: 0, rounding_method: 'ceil_per_trip' };
+    if (!units.length) return res.json({ trips: [], settings });
+    const unitIds = units.map(u => u.id);
+    const unitNameById = Object.fromEntries(units.map(u => [u.id, u.name]));
+    const sixMonthsAgo = new Date();
+    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+    const cutoff = sixMonthsAgo.toISOString().slice(0, 10);
+    const rows = await dbAll(
+      `SELECT id, unit_id, date, type, departure_time, return_time FROM trips
+       WHERE unit_id = ANY($1) AND date >= $2 ORDER BY date DESC`,
+      [unitIds, cutoff]
+    );
+    const trips = rows.map(t => ({
+      id: t.id, unitName: unitNameById[t.unit_id], date: t.date, type: t.type,
+      departureTime: t.departure_time, returnTime: t.return_time,
+      durationHours: tripDurationHours(t.departure_time, t.return_time),
+    }));
+    res.json({ trips, settings });
+  } catch (e) { console.error('Błąd /api/gmina/trips:', e.message); res.status(500).json({ error: 'Błąd odczytu wyjazdów.' }); }
 });
 
 // Terminy ważności: pojazdy (OC, przegląd techniczny) i sprzęt/ubrania —
@@ -826,38 +846,40 @@ app.get('/api/gmina/trips', requireGminaAuth, async (req, res) => {
 // panelu. Zwracamy WSZYSTKIE wpisy (nie tylko "wkrótce wygasające") — front-end
 // sam podświetla pilne terminy; gmina i tak powinna widzieć pełny obraz.
 app.get('/api/gmina/compliance', requireGminaAuth, async (req, res) => {
-  const units = await dbAll(`SELECT id, name FROM units WHERE gmina_code = $1 ORDER BY name`, [req.gmina.gminaCode]);
-  if (!units.length) return res.json({ vehicles: [], gear: [], medicalByUnit: [] });
-  const unitIds = units.map(u => u.id);
-  const unitNameById = Object.fromEntries(units.map(u => [u.id, u.name]));
+  try {
+    const units = await dbAll(`SELECT id, name FROM units WHERE gmina_code = $1 ORDER BY name`, [req.gmina.gminaCode]);
+    if (!units.length) return res.json({ vehicles: [], gear: [], medicalByUnit: [] });
+    const unitIds = units.map(u => u.id);
+    const unitNameById = Object.fromEntries(units.map(u => [u.id, u.name]));
 
-  const vehicleRows = await dbAll(
-    `SELECT unit_id, name, plate, oc_date, review_date FROM vehicles WHERE unit_id = ANY($1) ORDER BY oc_date NULLS LAST`,
-    [unitIds]
-  );
-  const vehicles = vehicleRows.map(v => ({
-    unitName: unitNameById[v.unit_id], name: v.name, plate: v.plate,
-    ocDate: v.oc_date, reviewDate: v.review_date,
-  }));
+    const vehicleRows = await dbAll(
+      `SELECT unit_id, name, plate, oc_date, review_date FROM vehicles WHERE unit_id = ANY($1) ORDER BY oc_date NULLS LAST`,
+      [unitIds]
+    );
+    const vehicles = vehicleRows.map(v => ({
+      unitName: unitNameById[v.unit_id], name: v.name, plate: v.plate,
+      ocDate: v.oc_date, reviewDate: v.review_date,
+    }));
 
-  const gearRows = await dbAll(
-    `SELECT unit_id, name, category, review_date FROM gear WHERE unit_id = ANY($1) AND review_date IS NOT NULL ORDER BY review_date`,
-    [unitIds]
-  );
-  const gear = gearRows.map(g => ({
-    unitName: unitNameById[g.unit_id], name: g.name, category: g.category, reviewDate: g.review_date,
-  }));
+    const gearRows = await dbAll(
+      `SELECT unit_id, name, category, review_date FROM gear WHERE unit_id = ANY($1) AND review_date IS NOT NULL ORDER BY review_date`,
+      [unitIds]
+    );
+    const gear = gearRows.map(g => ({
+      unitName: unitNameById[g.unit_id], name: g.name, category: g.category, reviewDate: g.review_date,
+    }));
 
-  const medicalByUnit = await Promise.all(units.map(async (unit) => {
-    const [total, expiring30, overdue] = await Promise.all([
-      dbGet(`SELECT COUNT(*)::int AS n FROM firefighters WHERE unit_id = $1 AND med_date IS NOT NULL`, [unit.id]),
-      dbGet(`SELECT COUNT(*)::int AS n FROM firefighters WHERE unit_id = $1 AND med_date IS NOT NULL AND med_date::date BETWEEN NOW()::date AND (NOW() + INTERVAL '30 days')::date`, [unit.id]),
-      dbGet(`SELECT COUNT(*)::int AS n FROM firefighters WHERE unit_id = $1 AND med_date IS NOT NULL AND med_date::date < NOW()::date`, [unit.id]),
-    ]);
-    return { unitName: unit.name, withMedicalDate: total.n, expiring30: expiring30.n, overdue: overdue.n };
-  }));
+    const medicalByUnit = await Promise.all(units.map(async (unit) => {
+      const [total, expiring30, overdue] = await Promise.all([
+        dbGet(`SELECT COUNT(*)::int AS n FROM firefighters WHERE unit_id = $1 AND med_date IS NOT NULL`, [unit.id]),
+        dbGet(`SELECT COUNT(*)::int AS n FROM firefighters WHERE unit_id = $1 AND med_date IS NOT NULL AND med_date::date BETWEEN NOW()::date AND (NOW() + INTERVAL '30 days')::date`, [unit.id]),
+        dbGet(`SELECT COUNT(*)::int AS n FROM firefighters WHERE unit_id = $1 AND med_date IS NOT NULL AND med_date::date < NOW()::date`, [unit.id]),
+      ]);
+      return { unitName: unit.name, withMedicalDate: total.n, expiring30: expiring30.n, overdue: overdue.n };
+    }));
 
-  res.json({ vehicles, gear, medicalByUnit });
+    res.json({ vehicles, gear, medicalByUnit });
+  } catch (e) { console.error('Błąd /api/gmina/compliance:', e.message); res.status(500).json({ error: 'Błąd odczytu terminów ważności.' }); }
 });
 
 // Ekwiwalent PER STRAŻAK — na wyraźną prośbę: gmina często wypłaca
@@ -867,65 +889,67 @@ app.get('/api/gmina/compliance', requireGminaAuth, async (req, res) => {
 // wyjazdy bez takiego przypisania NIE mają tu identyfikowalnych uczestników
 // (liczymy je osobno jako "tripsWithoutCrew", żeby było widać lukę).
 app.get('/api/gmina/trip-crew', requireGminaAuth, async (req, res) => {
-  const units = await dbAll(`SELECT id, name FROM units WHERE gmina_code = $1`, [req.gmina.gminaCode]);
-  if (!units.length) return res.json({ participations: [], tripsWithoutCrew: 0, tripsTotal: 0 });
-  const unitIds = units.map(u => u.id);
-  const unitNameById = Object.fromEntries(units.map(u => [u.id, u.name]));
+  try {
+    const units = await dbAll(`SELECT id, name FROM units WHERE gmina_code = $1`, [req.gmina.gminaCode]);
+    if (!units.length) return res.json({ participations: [], tripsWithoutCrew: 0, tripsTotal: 0 });
+    const unitIds = units.map(u => u.id);
+    const unitNameById = Object.fromEntries(units.map(u => [u.id, u.name]));
 
-  const sixMonthsAgo = new Date();
-  sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
-  const cutoff = sixMonthsAgo.toISOString().slice(0, 10);
+    const sixMonthsAgo = new Date();
+    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+    const cutoff = sixMonthsAgo.toISOString().slice(0, 10);
 
-  const trips = await dbAll(
-    `SELECT id, unit_id, date, type, departure_time, return_time FROM trips WHERE unit_id = ANY($1) AND date >= $2`,
-    [unitIds, cutoff]
-  );
-  if (!trips.length) return res.json({ participations: [], tripsWithoutCrew: 0, tripsTotal: 0 });
-  const tripById = Object.fromEntries(trips.map(t => [t.id, t]));
-  const tripIds = trips.map(t => t.id);
+    const trips = await dbAll(
+      `SELECT id, unit_id, date, type, departure_time, return_time FROM trips WHERE unit_id = ANY($1) AND date >= $2`,
+      [unitIds, cutoff]
+    );
+    if (!trips.length) return res.json({ participations: [], tripsWithoutCrew: 0, tripsTotal: 0 });
+    const tripById = Object.fromEntries(trips.map(t => [t.id, t]));
+    const tripIds = trips.map(t => t.id);
 
-  const firefighters = await dbAll(`SELECT id, unit_id, first, last FROM firefighters WHERE unit_id = ANY($1)`, [unitIds]);
-  const ffById = Object.fromEntries(firefighters.map(f => [f.id, f]));
+    const firefighters = await dbAll(`SELECT id, unit_id, first, last FROM firefighters WHERE unit_id = ANY($1)`, [unitIds]);
+    const ffById = Object.fromEntries(firefighters.map(f => [f.id, f]));
 
-  const tripVehicles = await dbAll(
-    `SELECT trip_id, commander_id, driver_id, rescuer_ids FROM trip_vehicles WHERE trip_id = ANY($1)`,
-    [tripIds]
-  );
-  const tripsWithCrew = new Set(tripVehicles.map(tv => tv.trip_id));
+    const tripVehicles = await dbAll(
+      `SELECT trip_id, commander_id, driver_id, rescuer_ids FROM trip_vehicles WHERE trip_id = ANY($1)`,
+      [tripIds]
+    );
+    const tripsWithCrew = new Set(tripVehicles.map(tv => tv.trip_id));
 
-  const participationByFirefighter = {};
-  for (const tv of tripVehicles) {
-    const trip = tripById[tv.trip_id];
-    if (!trip) continue;
-    const durationHours = tripDurationHours(trip.departure_time, trip.return_time);
-    const roleByFirefighter = {};
-    if (tv.commander_id) roleByFirefighter[tv.commander_id] = 'Dowódca';
-    if (tv.driver_id) roleByFirefighter[tv.driver_id] = roleByFirefighter[tv.driver_id] ? roleByFirefighter[tv.driver_id] + ' / Kierowca' : 'Kierowca';
-    (tv.rescuer_ids || []).forEach(rid => { if (!roleByFirefighter[rid]) roleByFirefighter[rid] = 'Ratownik'; });
+    const participationByFirefighter = {};
+    for (const tv of tripVehicles) {
+      const trip = tripById[tv.trip_id];
+      if (!trip) continue;
+      const durationHours = tripDurationHours(trip.departure_time, trip.return_time);
+      const roleByFirefighter = {};
+      if (tv.commander_id) roleByFirefighter[tv.commander_id] = 'Dowódca';
+      if (tv.driver_id) roleByFirefighter[tv.driver_id] = roleByFirefighter[tv.driver_id] ? roleByFirefighter[tv.driver_id] + ' / Kierowca' : 'Kierowca';
+      (tv.rescuer_ids || []).forEach(rid => { if (!roleByFirefighter[rid]) roleByFirefighter[rid] = 'Ratownik'; });
 
-    Object.keys(roleByFirefighter).forEach(fid => {
-      const ff = ffById[fid];
-      if (!ff) return; // strażak móg zostać usunięty od tego czasu
-      if (!participationByFirefighter[fid]) {
-        participationByFirefighter[fid] = {
-          firefighterId: fid, first: ff.first, last: ff.last, unitName: unitNameById[ff.unit_id], trips: [],
-        };
-      }
-      // ta sama osoba może być przypisana do kilku pojazdów w tym samym wyjeździe
-      // (np. dowódca jednego wozu i ratownik drugiego) — liczymy wyjazd raz.
-      if (!participationByFirefighter[fid].trips.find(t => t.tripId === trip.id)) {
-        participationByFirefighter[fid].trips.push({
-          tripId: trip.id, date: trip.date, type: trip.type, durationHours, role: roleByFirefighter[fid],
-        });
-      }
+      Object.keys(roleByFirefighter).forEach(fid => {
+        const ff = ffById[fid];
+        if (!ff) return; // strażak móg zostać usunięty od tego czasu
+        if (!participationByFirefighter[fid]) {
+          participationByFirefighter[fid] = {
+            firefighterId: fid, first: ff.first, last: ff.last, unitName: unitNameById[ff.unit_id], trips: [],
+          };
+        }
+        // ta sama osoba może być przypisana do kilku pojazdów w tym samym wyjeździe
+        // (np. dowódca jednego wozu i ratownik drugiego) — liczymy wyjazd raz.
+        if (!participationByFirefighter[fid].trips.find(t => t.tripId === trip.id)) {
+          participationByFirefighter[fid].trips.push({
+            tripId: trip.id, date: trip.date, type: trip.type, durationHours, role: roleByFirefighter[fid],
+          });
+        }
+      });
+    }
+
+    res.json({
+      participations: Object.values(participationByFirefighter),
+      tripsWithoutCrew: trips.length - tripsWithCrew.size,
+      tripsTotal: trips.length,
     });
-  }
-
-  res.json({
-    participations: Object.values(participationByFirefighter),
-    tripsWithoutCrew: trips.length - tripsWithCrew.size,
-    tripsTotal: trips.length,
-  });
+  } catch (e) { console.error('Błąd /api/gmina/trip-crew:', e.message); res.status(500).json({ error: 'Błąd odczytu załóg wyjazdów.' }); }
 });
 
 // ---------- KONTA UŻYTKOWNIKÓW ----------
