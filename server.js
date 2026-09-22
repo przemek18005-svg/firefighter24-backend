@@ -810,32 +810,67 @@ app.put('/api/gmina/settings', requireGminaAuth, validateBody({
   } catch (e) { console.error('Błąd /api/gmina/settings (PUT):', e.message); res.status(500).json({ error: 'Błąd zapisu ustawień.' }); }
 });
 
-// Lista wyjazdów jednostek tej gminy z ostatnich 6 miesięcy, z policzonym
-// czasem trwania każdego — do wyliczenia ekwiwalentu. Celowo BEZ adresu,
-// opisu, załogi czy innych szczegółów operacyjnych — tylko to, co potrzebne
-// do rozliczenia czasu (data, rodzaj, godziny, czas trwania).
+// Lista wyjazdów jednostek tej gminy, z policzonym czasem trwania i listą
+// uczestników każdego wyjazdu (do wyliczenia ekwiwalentu i podglądu "kto
+// brał udział"). Celowo BEZ adresu, opisu i innych szczegółów operacyjnych.
+// Domyślnie ostatnie 6 miesięcy — ?from=YYYY-MM-DD&to=YYYY-MM-DD pozwala
+// gminie samodzielnie wskazać dowolny okres.
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 app.get('/api/gmina/trips', requireGminaAuth, async (req, res) => {
   try {
     const units = await dbAll(`SELECT id, name FROM units WHERE gmina_code = $1 ORDER BY name`, [req.gmina.gminaCode]);
     const settings = (await dbGet(`SELECT rate_per_hour, rounding_method FROM gmina_settings WHERE gmina_code = $1`, [req.gmina.gminaCode]))
       || { rate_per_hour: 0, rounding_method: 'ceil_per_trip' };
-    if (!units.length) return res.json({ trips: [], settings });
+    if (!units.length) return res.json({ trips: [], settings, from: null, to: null });
     const unitIds = units.map(u => u.id);
     const unitNameById = Object.fromEntries(units.map(u => [u.id, u.name]));
+
     const sixMonthsAgo = new Date();
     sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
-    const cutoff = sixMonthsAgo.toISOString().slice(0, 10);
+    const defaultFrom = sixMonthsAgo.toISOString().slice(0, 10);
+    const defaultTo = new Date().toISOString().slice(0, 10);
+    const from = ISO_DATE_RE.test(req.query.from) ? req.query.from : defaultFrom;
+    const to = ISO_DATE_RE.test(req.query.to) ? req.query.to : defaultTo;
+
     const rows = await dbAll(
       `SELECT id, unit_id, date, type, departure_time, return_time FROM trips
-       WHERE unit_id = ANY($1) AND date >= $2 ORDER BY date DESC`,
-      [unitIds, cutoff]
+       WHERE unit_id = ANY($1) AND date >= $2 AND date <= $3 ORDER BY date DESC`,
+      [unitIds, from, to]
     );
+    const tripIds = rows.map(t => t.id);
+
+    // Uczestnicy per wyjazd — ta sama logika co w /api/gmina/trip-crew, tylko
+    // pogrupowana po wyjeździe zamiast po strażaku (żeby dało się "kliknąć
+    // wyjazd i zobaczyć kto brał udział").
+    let participantsByTrip = {};
+    if (tripIds.length) {
+      const firefighters = await dbAll(`SELECT id, unit_id, first, last FROM firefighters WHERE unit_id = ANY($1)`, [unitIds]);
+      const ffById = Object.fromEntries(firefighters.map(f => [f.id, f]));
+      const tripVehicles = await dbAll(
+        `SELECT trip_id, commander_id, driver_id, rescuer_ids FROM trip_vehicles WHERE trip_id = ANY($1)`,
+        [tripIds]
+      );
+      for (const tv of tripVehicles) {
+        if (!participantsByTrip[tv.trip_id]) participantsByTrip[tv.trip_id] = {};
+        const roleByFirefighter = participantsByTrip[tv.trip_id];
+        if (tv.commander_id) roleByFirefighter[tv.commander_id] = 'Dowódca';
+        if (tv.driver_id) roleByFirefighter[tv.driver_id] = roleByFirefighter[tv.driver_id] ? roleByFirefighter[tv.driver_id] + ' / Kierowca' : 'Kierowca';
+        (tv.rescuer_ids || []).forEach(rid => { if (!roleByFirefighter[rid]) roleByFirefighter[rid] = 'Ratownik'; });
+      }
+      Object.keys(participantsByTrip).forEach(tripId => {
+        participantsByTrip[tripId] = Object.entries(participantsByTrip[tripId])
+          .map(([fid, role]) => { const ff = ffById[fid]; return ff ? { name: `${ff.first} ${ff.last}`, role } : null; })
+          .filter(Boolean);
+      });
+    }
+
     const trips = rows.map(t => ({
       id: t.id, unitName: unitNameById[t.unit_id], date: t.date, type: t.type,
       departureTime: t.departure_time, returnTime: t.return_time,
       durationHours: tripDurationHours(t.departure_time, t.return_time),
+      participants: participantsByTrip[t.id] || [],
     }));
-    res.json({ trips, settings });
+    res.json({ trips, settings, from, to });
   } catch (e) { console.error('Błąd /api/gmina/trips:', e.message); res.status(500).json({ error: 'Błąd odczytu wyjazdów.' }); }
 });
 
