@@ -128,6 +128,21 @@ async function initSchema() {
       rescuer_ids JSONB NOT NULL DEFAULT '[]'::jsonb
     );
 
+    -- Wyjątki obecności: domyślnie każdy uczestnik wyjazdu liczy się na cały
+    -- czas trwania (departure_time/return_time samego wyjazdu). Wpis w tej
+    -- tabeli oznacza, że dana osoba była obecna tylko przez CZĘŚĆ wyjazdu
+    -- (rotacja/podmiana przy długich akcjach) — z WŁASNYMI godzinami.
+    -- Brak wpisu = cały wyjazd (zachowanie sprzed tej zmiany, bez migracji).
+    CREATE TABLE IF NOT EXISTS trip_participant_overrides (
+      id TEXT PRIMARY KEY,
+      unit_id TEXT NOT NULL REFERENCES units(id) ON DELETE CASCADE,
+      trip_id TEXT NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+      firefighter_id TEXT NOT NULL REFERENCES firefighters(id) ON DELETE CASCADE,
+      departure_time TEXT NOT NULL,
+      return_time TEXT NOT NULL,
+      UNIQUE(trip_id, firefighter_id)
+    );
+
     CREATE TABLE IF NOT EXISTS schedule (
       id TEXT PRIMARY KEY,
       unit_id TEXT NOT NULL REFERENCES units(id) ON DELETE CASCADE,
@@ -317,6 +332,7 @@ async function initSchema() {
     ALTER TABLE trips ADD COLUMN IF NOT EXISTS attachment_data TEXT;
     CREATE INDEX IF NOT EXISTS idx_trip_vehicles_unit ON trip_vehicles(unit_id);
     CREATE INDEX IF NOT EXISTS idx_trip_vehicles_trip ON trip_vehicles(trip_id);
+    CREATE INDEX IF NOT EXISTS idx_trip_overrides_trip ON trip_participant_overrides(trip_id);
     CREATE INDEX IF NOT EXISTS idx_purchase_requests_unit ON purchase_requests(unit_id);
   `);
 }

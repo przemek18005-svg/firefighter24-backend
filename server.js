@@ -528,6 +528,51 @@ app.delete('/api/trip-vehicles/:id', requireAuth, tripPerm, async (req, res) => 
   res.status(204).end();
 });
 
+// Wyjątki obecności — kto był na CAŁYM wyjeździe (domyślnie, brak wpisu tutaj)
+// a kto tylko na CZĘŚCI (rotacja/podmiana przy długich akcjach) z własnymi
+// godzinami. GET zwraca aktualny stan, PUT zastępuje CAŁOŚĆ na nowo (prostszy
+// i bezpieczniejszy model niż osobne dodawanie/usuwanie pojedynczych wpisów —
+// front-end i tak zawsze wysyła pełną, aktualną listę z formularza).
+app.get('/api/trips/:tripId/participant-overrides', requireAuth, tripPerm, async (req, res) => {
+  try {
+    const trip = await dbGet(`SELECT id FROM trips WHERE id = $1 AND unit_id = $2`, [req.params.tripId, req.user.unitId]);
+    if (!trip) return res.status(404).json({ error: 'Nie znaleziono wyjazdu.' });
+    const rows = await dbAll(
+      `SELECT firefighter_id, departure_time, return_time FROM trip_participant_overrides WHERE trip_id = $1`,
+      [req.params.tripId]
+    );
+    res.json(rows);
+  } catch (e) { console.error('Błąd odczytu obecności:', e.message); res.status(500).json({ error: 'Błąd odczytu obecności.' }); }
+});
+
+app.put('/api/trips/:tripId/participant-overrides', requireAuth, tripPerm, async (req, res) => {
+  try {
+    const trip = await dbGet(`SELECT id FROM trips WHERE id = $1 AND unit_id = $2`, [req.params.tripId, req.user.unitId]);
+    if (!trip) return res.status(404).json({ error: 'Nie znaleziono wyjazdu.' });
+    const overrides = Array.isArray(req.body.overrides) ? req.body.overrides : [];
+    const clean = overrides.filter(o => o && o.firefighter_id && ISO_TIME_RE.test(o.departure_time) && ISO_TIME_RE.test(o.return_time));
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`DELETE FROM trip_participant_overrides WHERE trip_id = $1`, [req.params.tripId]);
+      for (const o of clean) {
+        await client.query(
+          `INSERT INTO trip_participant_overrides (id, unit_id, trip_id, firefighter_id, departure_time, return_time) VALUES ($1,$2,$3,$4,$5,$6)`,
+          [uuid(), req.user.unitId, req.params.tripId, o.firefighter_id, o.departure_time, o.return_time]
+        );
+      }
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+    res.json({ ok: true, count: clean.length });
+  } catch (e) { console.error('Błąd zapisu obecności:', e.message); res.status(500).json({ error: 'Błąd zapisu obecności.' }); }
+});
+
 app.use('/api/schedule', crudRoutes({
   table: 'schedule', fields: ['type', 'date', 'description'],
   writeRoles: ['Zarząd'], permissionFlag: 'schedule', auditLabel: 'wydarzenie w terminarzu',
@@ -776,6 +821,7 @@ app.get('/api/gmina/overview', requireGminaAuth, async (req, res) => {
 // Czas trwania wyjazdu w godzinach (liczba dziesiętna), z obsługą przypadku
 // gdy powrót jest po północy (np. wyjazd 23:40 -> powrót 00:20). Zwraca null,
 // gdy brakuje którejś z godzin — takiego wyjazdu nie da się policzyć.
+const ISO_TIME_RE = /^\d{1,2}:\d{2}$/;
 function tripDurationHours(departureTime, returnTime) {
   if (!departureTime || !returnTime) return null;
   const dm = /^(\d{1,2}):(\d{2})$/.exec(departureTime);
@@ -841,7 +887,8 @@ app.get('/api/gmina/trips', requireGminaAuth, async (req, res) => {
 
     // Uczestnicy per wyjazd — ta sama logika co w /api/gmina/trip-crew, tylko
     // pogrupowana po wyjeździe zamiast po strażaku (żeby dało się "kliknąć
-    // wyjazd i zobaczyć kto brał udział").
+    // wyjazd i zobaczyć kto brał udział"). Uwzględnia wyjątki obecności —
+    // ktoś mógł być tylko na CZĘŚCI wyjazdu (rotacja/podmiana).
     let participantsByTrip = {};
     if (tripIds.length) {
       const firefighters = await dbAll(`SELECT id, unit_id, first, last FROM firefighters WHERE unit_id = ANY($1)`, [unitIds]);
@@ -850,6 +897,13 @@ app.get('/api/gmina/trips', requireGminaAuth, async (req, res) => {
         `SELECT trip_id, commander_id, driver_id, rescuer_ids FROM trip_vehicles WHERE trip_id = ANY($1)`,
         [tripIds]
       );
+      const overrideRows = await dbAll(
+        `SELECT trip_id, firefighter_id, departure_time, return_time FROM trip_participant_overrides WHERE trip_id = ANY($1)`,
+        [tripIds]
+      );
+      const overrideByKey = Object.fromEntries(overrideRows.map(o => [o.trip_id + '|' + o.firefighter_id, o]));
+      const tripById = Object.fromEntries(rows.map(t => [t.id, t]));
+
       for (const tv of tripVehicles) {
         if (!participantsByTrip[tv.trip_id]) participantsByTrip[tv.trip_id] = {};
         const roleByFirefighter = participantsByTrip[tv.trip_id];
@@ -858,8 +912,21 @@ app.get('/api/gmina/trips', requireGminaAuth, async (req, res) => {
         (tv.rescuer_ids || []).forEach(rid => { if (!roleByFirefighter[rid]) roleByFirefighter[rid] = 'Ratownik'; });
       }
       Object.keys(participantsByTrip).forEach(tripId => {
+        const trip = tripById[tripId];
         participantsByTrip[tripId] = Object.entries(participantsByTrip[tripId])
-          .map(([fid, role]) => { const ff = ffById[fid]; return ff ? { name: `${ff.first} ${ff.last}`, role } : null; })
+          .map(([fid, role]) => {
+            const ff = ffById[fid];
+            if (!ff) return null;
+            const override = overrideByKey[tripId + '|' + fid];
+            const durationHours = override
+              ? tripDurationHours(override.departure_time, override.return_time)
+              : tripDurationHours(trip.departure_time, trip.return_time);
+            return {
+              name: `${ff.first} ${ff.last}`, role, partial: !!override, durationHours,
+              departureTime: override ? override.departure_time : trip.departure_time,
+              returnTime: override ? override.return_time : trip.return_time,
+            };
+          })
           .filter(Boolean);
       });
     }
@@ -954,12 +1021,16 @@ app.get('/api/gmina/trip-crew', requireGminaAuth, async (req, res) => {
       [tripIds]
     );
     const tripsWithCrew = new Set(tripVehicles.map(tv => tv.trip_id));
+    const overrideRows = await dbAll(
+      `SELECT trip_id, firefighter_id, departure_time, return_time FROM trip_participant_overrides WHERE trip_id = ANY($1)`,
+      [tripIds]
+    );
+    const overrideByKey = Object.fromEntries(overrideRows.map(o => [o.trip_id + '|' + o.firefighter_id, o]));
 
     const participationByFirefighter = {};
     for (const tv of tripVehicles) {
       const trip = tripById[tv.trip_id];
       if (!trip) continue;
-      const durationHours = tripDurationHours(trip.departure_time, trip.return_time);
       const roleByFirefighter = {};
       if (tv.commander_id) roleByFirefighter[tv.commander_id] = 'Dowódca';
       if (tv.driver_id) roleByFirefighter[tv.driver_id] = roleByFirefighter[tv.driver_id] ? roleByFirefighter[tv.driver_id] + ' / Kierowca' : 'Kierowca';
@@ -976,8 +1047,12 @@ app.get('/api/gmina/trip-crew', requireGminaAuth, async (req, res) => {
         // ta sama osoba może być przypisana do kilku pojazdów w tym samym wyjeździe
         // (np. dowódca jednego wozu i ratownik drugiego) — liczymy wyjazd raz.
         if (!participationByFirefighter[fid].trips.find(t => t.tripId === trip.id)) {
+          const override = overrideByKey[trip.id + '|' + fid];
+          const durationHours = override
+            ? tripDurationHours(override.departure_time, override.return_time)
+            : tripDurationHours(trip.departure_time, trip.return_time);
           participationByFirefighter[fid].trips.push({
-            tripId: trip.id, date: trip.date, type: trip.type, durationHours, role: roleByFirefighter[fid],
+            tripId: trip.id, date: trip.date, type: trip.type, durationHours, role: roleByFirefighter[fid], partial: !!override,
           });
         }
       });
@@ -1092,7 +1167,7 @@ app.get('/api/backup/full', requireAuth, requireRole('Zarząd'), async (req, res
   const tables = {
     firefighters: 'firefighters', vehicles: 'vehicles', fuel: 'fuel_log', gear: 'gear',
     trips: 'trips', schedule: 'schedule', dues: 'dues', mdpMembers: 'mdp_members',
-    mdpMeetings: 'mdp_meetings', tasks: 'tasks', announcements: 'announcements', sections: 'sections', exercises: 'exercises', tripVehicles: 'trip_vehicles', purchases: 'purchase_requests',
+    mdpMeetings: 'mdp_meetings', tasks: 'tasks', announcements: 'announcements', sections: 'sections', exercises: 'exercises', tripVehicles: 'trip_vehicles', purchases: 'purchase_requests', tripParticipantOverrides: 'trip_participant_overrides',
   };
   const data = {};
   for (const [key, table] of Object.entries(tables)) {
